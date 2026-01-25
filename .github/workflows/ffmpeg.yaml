@@ -1,0 +1,63 @@
+name: Run Cloudflared and Node App
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch: # 允许手动触发
+
+jobs:
+  build-and-run:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. 检出代码
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # 2. 安装 Node.js
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20' # 你可以根据需要更改版本
+
+      # 3. 安装 FFmpeg
+      #- name: Install FFmpeg
+        #uses: federicocarboni/setup-ffmpeg@v3
+        #with:
+          #token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          # 安装 ffmpeg 和 sensors (对应你代码里的 exec('sensors'))
+          sudo apt-get install -y ffmpeg lm-sensors
+          # 检查 sensors 是否能跑（在虚拟机里可能返回空，但不会报错）
+          sensors || true
+
+      # 4. 安装 cloudflared
+      - name: Install cloudflared
+        run: |
+          curl -L --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/download/2026.1.1/cloudflared-linux-amd64.deb
+          sudo dpkg -i cloudflared.deb
+
+      # 5. 安装 npm 依赖
+      - name: Install dependencies
+        run: |
+          npm install playwright express fluent-ffmpeg axios fs-extra
+
+      # 6. 安装 Playwright 所需的浏览器内核及系统依赖 (无头 Chrome)
+      - name: Install Playwright Browsers
+        run: |
+          npx playwright install chromium --with-deps
+
+      # 7. 启动隧道并运行 Node.js 应用
+      - name: Start Tunnel and App
+        env:
+          CF_TOKEN: "eyJhIjoiZDg5ZDIwZmE5NjYxOGQ1NjVkYzY1NGNhNzAwMzAyY2IiLCJ0IjoiNTRmZjk0OGUtN2E4Zi00ODkwLWFkZmEtZmRlZTMyMzkyYjAxIiwicyI6Ik9ETXpNR1F6TVdJdFlUSmxOeTAwWmpWakxXSmxOV010WkdZeU5HSmpORGt5TkRCbSJ9"
+        run: |
+          # 后台启动 Cloudflare Tunnel
+          # 使用 nohup 或 & 确保它不会阻塞后续命令
+          sudo cloudflared service install $CF_TOKEN
+
+          # 运行 Node.js 应用
+          # 如果 app.js 是一个 Web 服务器，它将保持运行直到 Action 超时
+          node app.js
