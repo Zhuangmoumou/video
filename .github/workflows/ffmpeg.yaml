@@ -49,8 +49,8 @@ jobs:
         run: |
           npx playwright install chromium --with-deps
 
-      # 7. 启动隧道并运行 Node.js 应用
-      - name: Start Tunnel and App
+      # 7. 启动隧道
+      - name: Start Tunnel
         env:
           CF_TOKEN: "eyJhIjoiZDg5ZDIwZmE5NjYxOGQ1NjVkYzY1NGNhNzAwMzAyY2IiLCJ0IjoiNTIxZjA0NzctOWE5MS00NjgzLTk5MmEtM2JmMzEyNzViMTI0IiwicyI6Ik9EZGhZV1V3TWpNdE5qSmpZaTAwTldFNExXSXdPR0V0TW1Zd09ERTNaREUwTlRZdyJ9"
         run: |
@@ -58,6 +58,8 @@ jobs:
           # 使用 nohup 或 & 确保它不会阻塞后续命令
           sudo cloudflared service install $CF_TOKEN
 
+      - name: Start App
           # 运行 Node.js 应用
           # 如果 app.js 是一个 Web 服务器，它将保持运行直到 Action 超时
+        run: |
           node app.js
