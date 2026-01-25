@@ -52,7 +52,7 @@ jobs:
       # 7. 启动隧道并运行 Node.js 应用
       - name: Start Tunnel and App
         env:
-          CF_TOKEN: "eyJhIjoiZDg5ZDIwZmE5NjYxOGQ1NjVkYzY1NGNhNzAwMzAyY2IiLCJ0IjoiNTRmZjk0OGUtN2E4Zi00ODkwLWFkZmEtZmRlZTMyMzkyYjAxIiwicyI6Ik9ETXpNR1F6TVdJdFlUSmxOeTAwWmpWakxXSmxOV010WkdZeU5HSmpORGt5TkRCbSJ9"
+          CF_TOKEN: "eyJhIjoiZDg5ZDIwZmE5NjYxOGQ1NjVkYzY1NGNhNzAwMzAyY2IiLCJ0IjoiNTIxZjA0NzctOWE5MS00NjgzLTk5MmEtM2JmMzEyNzViMTI0IiwicyI6Ik9EZGhZV1V3TWpNdE5qSmpZaTAwTldFNExXSXdPR0V0TW1Zd09ERTNaREUwTlRZdyJ9"
         run: |
           # 后台启动 Cloudflare Tunnel
           # 使用 nohup 或 & 确保它不会阻塞后续命令
