@@ -1,4 +1,4 @@
-name: Run Cloudflared and Node App
+name: Run App
 
 on:
   push:
