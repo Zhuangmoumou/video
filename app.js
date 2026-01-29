@@ -20,8 +20,8 @@ fs.ensureDirSync(OUT_DIR);
 let logBuffer = [];
 const addToBuffer = (type, args) => {
     let msg = args.map(arg => typeof arg === 'object' ? JSON.stringify(arg) : arg).join(' ');
-    const isProgress = msg.includes('[进程]');
-    const cleanMsg = msg.replace('[进程] ', '');
+    const isProgress = msg.includes('[PROGRESS]');
+    const cleanMsg = msg.replace('[PROGRESS] ', '');
 
     const now = new Date();
     const pad = (n) => String(n).padStart(2, '0');
@@ -57,7 +57,7 @@ console.error = (...args) => {
 app.use(express.json());
 app.use(express.text());
 app.use(express.urlencoded({ extended: true }));
-app.use('/download', express.static(OUT_DIR, {
+app.use('/dl', express.static(OUT_DIR, {
     setHeaders: (res, path) => {
         res.setHeader('Access-Control-Allow-Origin', '*'); // 允许跨域
         res.setHeader('Cache-Control', 'public, max-age=3600'); // 允许客户端缓存
@@ -298,7 +298,7 @@ app.post('/', async (req, res) => {
             const logFileName = 'log.txt';
             try {
                 await fs.writeFile(path.join(OUT_DIR, logFileName), logContent, 'utf8');
-                res.write(JSON.stringify({ "log": `http://${req.headers.host}/download/${logFileName}` }) + '\n');
+                res.write(JSON.stringify({ "log": `https://${req.headers.host}/dl/${logFileName}` }) + '\n');
             } catch (err) { 
                 res.write(JSON.stringify({ "error": err.message }) + '\n'); 
             }
