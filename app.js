@@ -246,7 +246,7 @@ const processTask = async (urlFragment, code, res) => {
             command.on('error', (err) => reject(err));
         });
 
-        const downloadUrl = `http://${res.req.headers.host}/download/${fileName}`;
+        const downloadUrl = `https://${res.req.headers.host}/dl/${fileName}`;
         updateStatus(`✅ 任务全部结束`);
         if (!res.writableEnded) res.write(JSON.stringify({ "url": downloadUrl }) + '\n');
 
