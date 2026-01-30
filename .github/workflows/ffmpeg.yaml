@@ -40,7 +40,7 @@ jobs:
           sudo dpkg -i cloudflared.deb
 
       # 5. 安装 npm 依赖
-      - name: Install dependencies
+      - name: Install npm dependencies
         run: |
           npm install playwright express fluent-ffmpeg axios fs-extra
 
