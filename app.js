@@ -161,7 +161,7 @@ const processTask = async (urlFragment, code, res) => {
         updateStatus(`🚀 任务开始 (${code})`);
         updateStatus(null, "🌏 正在启动无头浏览器...");
         
-        const browser = await chromium.launch({ headless: true });
+        const browser = await chromium.launch({ headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
         serverState.browser = browser;
         const page = await browser.newPage();
 
@@ -179,8 +179,11 @@ const processTask = async (urlFragment, code, res) => {
                 }
             });
         });
-
-        await page.goto(fullUrl, { waitUntil: 'domcontentloaded' });
+        try {
+        await page.goto(fullUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
+        } catch (e) {
+            throw new Error(`页面加载失败: ${e.message}`);
+        }
         const pageTitle = await page.title();
         updateStatus(`📄 页面标题: ${pageTitle || '未知'}`);
 
