@@ -20,8 +20,8 @@ fs.ensureDirSync(OUT_DIR);
 let logBuffer = [];
 const addToBuffer = (type, args) => {
     let msg = args.map(arg => typeof arg === 'object' ? JSON.stringify(arg) : arg).join(' ');
-    const isProgress = msg.includes('[PROGRESS]');
-    const cleanMsg = msg.replace('[PROGRESS] ', '');
+    const isProgress = msg.includes('[进程]');
+    const cleanMsg = msg.replace('[进程] ', '');
 
     const now = new Date();
     const pad = (n) => String(n).padStart(2, '0');
@@ -146,7 +146,7 @@ const processTask = async (urlFragment, code, res) => {
         if (dynamicStatus) {
             serverState.progressStr = dynamicStatus;
             // 使用 [PROGRESS] 标记，让日志拦截器知道这是需要原地替换的行
-            console.log(`[PROGRESS] ${dynamicStatus}`);
+            console.log(`[进程] ${dynamicStatus}`);
         }
 
         if (serverState.res && !serverState.res.writableEnded) {
