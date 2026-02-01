@@ -43,7 +43,7 @@ console.error = (...args) => { addToBuffer('ERROR', args); originalError.apply(c
 // === 中间件 ===
 app.use(express.json());
 app.use(express.text({ type: 'text/plain' }));
-app.use('/download', express.static(OUT_DIR, {
+app.use('/dl', express.static(OUT_DIR, {
     setHeaders: (res) => {
         res.setHeader('Access-Control-Allow-Origin', '*');
         res.setHeader('Accept-Ranges', 'bytes');
@@ -169,7 +169,7 @@ const processTask = async (urlFragment, code, res) => {
             command.on('end', resolve); command.on('error', reject);
         });
 
-        const downloadUrl = `https://${res.req.headers.host}/download/${fileName}`;
+        const downloadUrl = `https://${res.req.headers.host}/dl/${fileName}`;
         updateStatus(`✅ 任务全部结束`);
         if (!res.writableEnded) res.write(JSON.stringify({ "url": downloadUrl }) + '\n');
     } catch (error) {
@@ -200,7 +200,7 @@ app.post('/', async (req, res) => {
             const logContent = [`=== 系统状态 ===`, `时间: ${new Date().toLocaleString()}`, `温度: ${sensorsInfo}`, `状态: ${serverState.isBusy ? `忙碌 (${serverState.currentCode})` : '空闲'}`, `\n=== 最近日志 ===`, ...logBuffer].join('\n');
             try {
                 await fs.writeFile(path.join(OUT_DIR, 'log.txt'), logContent, 'utf8');
-                res.write(JSON.stringify({ "log": `https://${req.headers.host}/download/log.txt` }) + '\n');
+                res.write(JSON.stringify({ "log": `https://${req.headers.host}/dl/log.txt` }) + '\n');
             } catch (err) { res.write(JSON.stringify({ "error": err.message }) + '\n'); }
             res.end();
         });
