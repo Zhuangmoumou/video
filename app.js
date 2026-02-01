@@ -242,7 +242,7 @@ const processTask = async (urlFragment, code, res) => {
             const command = ffmpeg(downloadPath)
                 .outputOptions([
                     '-vf', 'scale=320:170:force_original_aspect_ratio=decrease,pad=320:170:(ow-iw)/2:(oh-ih)/2',
-                    '-c:v', 'libx264', '-crf', '23', '-preset', 'veryfast', '-c:a', 'copy'
+                    '-c:v', 'libx264', '-crf', '17', '-preset', 'medium', '-c:a', 'copy'
                 ])
                 .save(outPath);
 
