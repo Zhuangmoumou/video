@@ -272,13 +272,13 @@ const processTask = async (urlFragment, code, res) => {
     }
 };
 
-// === 路由入口 (严格保留 log, ls, stop, rm 逻辑) ===
+// === 路由入口 ===
 app.post('/', async (req, res) => {
     const body = req.body;
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
     res.setHeader('Transfer-Encoding', 'chunked');
 
-    // 1. 日志查询
+    // 1. 日志查询 (log)
     if (body === 'log' || body.log) {
         exec('sensors', async (error, stdout) => {
             let sensorsInfo = "N/A";
@@ -289,68 +289,96 @@ app.post('/', async (req, res) => {
                 const cIdx = lastLine.indexOf('C', plusIdx);
                 sensorsInfo = (plusIdx !== -1 && cIdx !== -1) ? lastLine.substring(plusIdx + 1, cIdx).trim() + "C" : "N/A";
             }
-            const logContent = [`=== 系统状态 ===`, `时间: ${new Date().toLocaleString()}`, `温度: ${sensorsInfo}`, `状态: ${serverState.isBusy ? `忙碌 (${serverState.currentCode})` : '空闲'}`, `\n=== 最近日志 ===`, ...logBuffer].join('\n');
+            
+            const logContent = [
+                `=== 系统状态 ===`, 
+                `时间: ${new Date().toLocaleString()}`, 
+                `温度: ${sensorsInfo}`, 
+                `状态: ${serverState.isBusy ? `忙碌 (${serverState.currentCode})` : '空闲'}`, 
+                `\n=== 最近日志 ===`, 
+                ...logBuffer
+            ].join('\n');
+    
             try {
                 await fs.writeFile(path.join(OUT_DIR, 'log.txt'), logContent, 'utf8');
                 res.write(JSON.stringify({ "log": `https://${req.headers.host}/dl/log.txt` }) + '\n');
-            } catch (err) { res.write(JSON.stringify({ "error": err.message }) + '\n'); }
+            } catch (err) { 
+                res.write(JSON.stringify({ "error": err.message }) + '\n'); 
+            }
             res.end();
         });
         return;
     }
 
-    // 2. 查询列表
+    // 2. 查询列表 (ls)
     if (body === 'ls' || body.ls) {
         try {
             const files = await fs.readdir(OUT_DIR);
             res.write(JSON.stringify({ "ls": files }) + '\n');
-        } catch (err) { res.write(JSON.stringify({ "error": err.message }) + '\n'); }
-        res.end(); return;
+        } catch (err) { 
+            res.write(JSON.stringify({ "error": err.message }) + '\n'); 
+        }
+        res.end(); 
+        return;
     }
 
-    // 3. 停止 (stop) - 仅停止任务
-    if (body === 'stop') {
+    // 3. 停止当前任务 (stop) - 仅打断，不删文件
+    if (body === 'stop' || body.stop) {
         let stopInfo = serverState.isBusy ? { task: serverState.currentTask, code: serverState.currentCode } : "无任务";
         await killAndReset();
         res.write(JSON.stringify({ "stop": stopInfo }) + '\n');
-        res.end(); return;
+        res.end(); 
+        return;
     }
 
-    // 4. 停止并删除 (rm) - 停止并清空目录
+    // 4. 停止并清理所有文件 (rm)
     if (body === 'rm' || body.rm) {
         let stopInfo = serverState.isBusy ? { task: serverState.currentTask, code: serverState.currentCode } : "无任务";
         await killAndReset();
         const deleted = await forceCleanFiles();
         res.write(JSON.stringify({ "stop": stopInfo, "del": deleted }) + '\n');
-        res.end(); return;
+        res.end(); 
+        return;
     }
 
-    // 5. 中止指定任务 (del)
+    // 5. 中止指定任务 (del) - 包含详细状态的三元表达式
     if (body.del) {
         const delCode = Number(body.del);
         if (serverState.isBusy && serverState.currentCode === delCode) {
             await killAndReset();
             res.write(JSON.stringify({ success: `任务 ${delCode} 已中止` }) + '\n');
         } else {
-            res.write(JSON.stringify({ "error": `任务 ${delCode} 不在运行中` }) + '\n');
+            // 三元表达式：忙碌时显示当前任务详情，空闲时显示无任务
+            const statusInfo = serverState.isBusy 
+                ? `当前运行中任务: ${serverState.currentCode} [${serverState.currentTask}]${serverState.progressStr ? ` (${serverState.progressStr})` : ""}` 
+                : "当前无任务";
+
+            res.write(JSON.stringify({ 
+                "error": `任务 ${delCode} 不在运行中\n\n${statusInfo}` 
+            }) + '\n');
         }
-        res.end(); return;
+        res.end(); 
+        return;
     }
 
-    // 6. 新建任务
+    // 6. 新建任务 (url + code)
     if (body.url && body.code) {
         const newCode = Number(body.code);
         if (serverState.isBusy) {
-            const prog = serverState.progressStr ? ` (${serverState.progressStr})` : "";
-            res.write(JSON.stringify({ "error": `服务器忙: ${serverState.currentCode} [${serverState.currentTask}]${prog}` }) + '\n');
-            res.end(); return;
+            // 同样使用详细的状态返回
+            const statusInfo = `当前运行中任务: ${serverState.currentCode} [${serverState.currentTask}]${serverState.progressStr ? ` (${serverState.progressStr})` : ""}`;
+            res.write(JSON.stringify({ "error": `服务器忙，无法开始新任务。\n\n${statusInfo}` }) + '\n');
+            res.end(); 
+            return;
         }
         serverState.isBusy = true;
         serverState.currentCode = newCode;
+        // 异步执行任务
         processTask(body.url, newCode, res);
         return;
     }
 
+    // 7. 无效请求
     res.write(JSON.stringify({ "error": "无效请求参数" }) + '\n');
     res.end();
 });
