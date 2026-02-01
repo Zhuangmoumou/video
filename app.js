@@ -136,7 +136,7 @@ const processTask = async (urlFragment, code, res) => {
 
         if (mediaUrl.includes('.m3u8')) {
             serverState.currentTask = 'M3U8下载';
-            updateStatus(`📦 检测到 M3U8，启动手动解析下载...`);
+            updateStatus(`📦 检测到 M3U8，启动解析下载...`);
             await downloadM3u8(mediaUrl, downloadPath, {
                 signal: serverState.abortController.signal,
                 headers: { 'Referer': 'https://omofun01.xyz/' },
