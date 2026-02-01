@@ -173,7 +173,11 @@ const processTask = async (urlFragment, code, res) => {
 
         const nameMatch = html.match(/var vod_name\s*=\s*'(.*?)'/);
         const partMatch = html.match(/var vod_part\s*=\s*'(.*?)'/);
-        const videoTitle = nameMatch ? `${nameMatch[1]} ${partMatch ? partMatch[1] : ''}` : '未知视频';
+        
+        const animeName = nameMatch ? nameMatch[1] : '未知番剧';
+        const episodePart = partMatch ? partMatch[1] : `第${nid}集`; // 如果正则没抓到集数，用 nid 补全
+        const videoTitle = `${animeName} ${episodePart}`;
+        
         updateStatus(`📄 视频标题: ${videoTitle}`);
 
         const playerMatch = html.match(/var player_aaaa\s*=\s*({.*?})<\/script>/);
@@ -242,7 +246,7 @@ const processTask = async (urlFragment, code, res) => {
             const command = ffmpeg(downloadPath)
                 .outputOptions([
                     '-vf', 'scale=320:170:force_original_aspect_ratio=decrease,pad=320:170:(ow-iw)/2:(oh-ih)/2',
-                    '-c:v', 'libx264', '-crf', '17', '-preset', 'medium', '-c:a', 'copy'
+                    '-c:v', 'libx264', '-crf', '18', '-preset', 'medium', '-c:a', 'copy'
                 ])
                 .save(outPath);
 
