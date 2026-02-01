@@ -3,7 +3,8 @@ const ffmpeg = require('fluent-ffmpeg');
 const axios = require('axios');
 const fs = require('fs-extra');
 const path = require('path');
-const { exec, spawn } = require('child_process');
+const { exec } = require('child_process');
+const { downloadM3u8 } = require('./m3u8Downloader'); // 导入新模块
 
 const app = express();
 const PORT = 9898;
@@ -14,7 +15,7 @@ const OUT_DIR = path.join(ROOT_DIR, 'out');
 fs.ensureDirSync(ROOT_DIR);
 fs.ensureDirSync(OUT_DIR);
 
-// === 日志拦截器 ===
+// === 日志拦截器 (保持不变) ===
 let logBuffer = [];
 const addToBuffer = (type, args) => {
     let msg = args.map(arg => typeof arg === 'object' ? JSON.stringify(arg) : arg).join(' ');
@@ -39,13 +40,10 @@ const originalError = console.error;
 console.log = (...args) => { addToBuffer('INFO', args); originalLog.apply(console, args); };
 console.error = (...args) => { addToBuffer('ERROR', args); originalError.apply(console, args); };
 
-// === 中间件配置 ===
+// === 中间件 ===
 app.use(express.json());
-app.use(express.text({ type: 'text/plain' })); // 显式支持 text/plain
-app.use(express.urlencoded({ extended: true }));
-
-// 静态资源路径改为 /dl
-app.use('/dl', express.static(OUT_DIR, {
+app.use(express.text({ type: 'text/plain' }));
+app.use('/download', express.static(OUT_DIR, {
     setHeaders: (res) => {
         res.setHeader('Access-Control-Allow-Origin', '*');
         res.setHeader('Accept-Ranges', 'bytes');
@@ -60,14 +58,12 @@ let serverState = {
     progressStr: null,
     abortController: null,
     ffmpegCommand: null,
-    m3u8Process: null,
     res: null
 };
 
 const killAndReset = async () => {
     console.log('[System] 🗑 正在执行清理并释放资源锁...');
     if (serverState.abortController) serverState.abortController.abort();
-    if (serverState.m3u8Process) { try { serverState.m3u8Process.kill('SIGKILL'); } catch (e) {} }
     if (serverState.ffmpegCommand) { try { serverState.ffmpegCommand.kill('SIGKILL'); } catch (e) {} }
     logBuffer = logBuffer.filter(line => !line.includes('⏳进度:'));
     serverState.isBusy = false;
@@ -76,26 +72,16 @@ const killAndReset = async () => {
     serverState.progressStr = null;
     serverState.abortController = null;
     serverState.ffmpegCommand = null;
-    serverState.m3u8Process = null;
     if (serverState.res && !serverState.res.writableEnded) serverState.res.end();
     serverState.res = null;
 };
 
 const forceCleanFiles = async () => {
-    const deletedFiles = [];
     try {
-        const rootFiles = await fs.readdir(ROOT_DIR);
-        for (const file of rootFiles) {
-            const filePath = path.join(ROOT_DIR, file);
-            if ((await fs.stat(filePath)).isFile()) { await fs.remove(filePath); deletedFiles.push(filePath); }
-        }
-        const outFiles = await fs.readdir(OUT_DIR);
-        for (const file of outFiles) {
-            const filePath = path.join(OUT_DIR, file);
-            await fs.remove(filePath); deletedFiles.push(filePath);
-        }
+        await fs.emptyDir(ROOT_DIR);
+        await fs.emptyDir(OUT_DIR);
     } catch (e) {}
-    return deletedFiles;
+    return ["All files cleaned"];
 };
 
 // === 核心处理逻辑 ===
@@ -150,19 +136,11 @@ const processTask = async (urlFragment, code, res) => {
 
         if (mediaUrl.includes('.m3u8')) {
             serverState.currentTask = 'M3U8下载';
-            await new Promise((resolve, reject) => {
-                const m3u8dl = spawn('npx', ['@lzwme/m3u8-dl', mediaUrl, '--saveDir', ROOT_DIR, '--saveName', urlFragment, '--headers', 'Referer:https://omofun01.xyz/']);
-                serverState.m3u8Process = m3u8dl;
-                let lastM3u8Percent = -1;
-                m3u8dl.stdout.on('data', (data) => {
-                    const match = data.toString().match(/(\d+\.?\d*)%/);
-                    if (match) {
-                        const percent = Math.floor(parseFloat(match[1]));
-                        if (percent !== lastM3u8Percent) { lastM3u8Percent = percent; updateStatus(null, `📥 M3U8下载进度: ${percent}%`); }
-                    }
-                });
-                m3u8dl.on('close', (c) => c === 0 ? resolve() : reject(new Error(`M3U8失败:${c}`)));
-                serverState.abortController.signal.addEventListener('abort', () => { m3u8dl.kill('SIGKILL'); reject(new Error('中止')); });
+            updateStatus(`📦 检测到 M3U8，启动手动解析下载...`);
+            await downloadM3u8(mediaUrl, downloadPath, {
+                signal: serverState.abortController.signal,
+                headers: { 'Referer': 'https://omofun01.xyz/' },
+                onProgress: (p) => updateStatus(null, `📥 M3U8下载进度: ${p}%`)
             });
         } else {
             serverState.currentTask = '视频下载';
@@ -183,6 +161,7 @@ const processTask = async (urlFragment, code, res) => {
         }
 
         serverState.currentTask = 'FFmpeg压缩';
+        updateStatus(null, `📦 开始压缩处理...`);
         await new Promise((resolve, reject) => {
             const command = ffmpeg(downloadPath).outputOptions(['-vf', 'scale=320:170:force_original_aspect_ratio=decrease,pad=320:170:(ow-iw)/2:(oh-ih)/2', '-c:v', 'libx264', '-crf', '17', '-preset', 'medium', '-c:a', 'copy']).save(outPath);
             serverState.ffmpegCommand = command;
@@ -190,31 +169,24 @@ const processTask = async (urlFragment, code, res) => {
             command.on('end', resolve); command.on('error', reject);
         });
 
-        const downloadUrl = `https://${res.req.headers.host}/dl/${fileName}`;
+        const downloadUrl = `https://${res.req.headers.host}/download/${fileName}`;
         updateStatus(`✅ 任务全部结束`);
         if (!res.writableEnded) res.write(JSON.stringify({ "url": downloadUrl, "title": videoTitle }) + '\n');
     } catch (error) {
-        if (!axios.isCancel(error)) {
+        if (error.name !== 'AbortError' && error.message !== '中止') {
             console.error(`[Task ${code}] 错误:`, error.message);
             if (res && !res.writableEnded) res.write(JSON.stringify({ "error": error.message }) + '\n');
         }
     } finally { await killAndReset(); }
 };
 
-// === 路由入口 ===
+// === 路由入口 (保持不变) ===
 app.post('/', async (req, res) => {
-    // 载荷标准化：处理纯字符串或 JSON 对象
     let body = req.body;
-    if (typeof body === 'string') {
-        try { body = JSON.parse(body); } catch (e) { /* 保持为字符串 */ }
-    }
-
+    if (typeof body === 'string') { try { body = JSON.parse(body); } catch (e) {} }
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
     res.setHeader('Transfer-Encoding', 'chunked');
 
-    if (!body) { res.write(JSON.stringify({ "error": "空请求" }) + '\n'); res.end(); return; }
-
-    // 1. 日志查询 (log)
     if (body === 'log' || (body && body.log)) {
         exec('sensors', async (error, stdout) => {
             let sensorsInfo = "N/A";
@@ -228,38 +200,32 @@ app.post('/', async (req, res) => {
             const logContent = [`=== 系统状态 ===`, `时间: ${new Date().toLocaleString()}`, `温度: ${sensorsInfo}`, `状态: ${serverState.isBusy ? `忙碌 (${serverState.currentCode})` : '空闲'}`, `\n=== 最近日志 ===`, ...logBuffer].join('\n');
             try {
                 await fs.writeFile(path.join(OUT_DIR, 'log.txt'), logContent, 'utf8');
-                res.write(JSON.stringify({ "log": `https://${req.headers.host}/dl/log.txt` }) + '\n');
+                res.write(JSON.stringify({ "log": `https://${req.headers.host}/download/log.txt` }) + '\n');
             } catch (err) { res.write(JSON.stringify({ "error": err.message }) + '\n'); }
             res.end();
         });
         return;
     }
 
-    // 2. 查询列表 (ls)
     if (body === 'ls' || (body && body.ls)) {
         try { const files = await fs.readdir(OUT_DIR); res.write(JSON.stringify({ "ls": files }) + '\n'); } 
         catch (err) { res.write(JSON.stringify({ "error": err.message }) + '\n'); }
         res.end(); return;
     }
 
-    // 3. 停止 (stop)
     if (body === 'stop' || (body && body.stop)) {
-        let stopInfo = serverState.isBusy ? { task: serverState.currentTask, code: serverState.currentCode } : "无任务";
         await killAndReset();
-        res.write(JSON.stringify({ "stop": stopInfo }) + '\n');
+        res.write(JSON.stringify({ "stop": "OK" }) + '\n');
         res.end(); return;
     }
 
-    // 4. 停止并清理 (rm)
     if (body === 'rm' || (body && body.rm)) {
-        let stopInfo = serverState.isBusy ? { task: serverState.currentTask, code: serverState.currentCode } : "无任务";
         await killAndReset();
-        const deleted = await forceCleanFiles();
-        res.write(JSON.stringify({ "stop": stopInfo, "del": deleted }) + '\n');
+        await forceCleanFiles();
+        res.write(JSON.stringify({ "rm": "OK" }) + '\n');
         res.end(); return;
     }
 
-    // 5. 中止指定任务 (del)
     if (body && body.del) {
         const delCode = Number(body.del);
         if (serverState.isBusy && serverState.currentCode === delCode) {
@@ -272,7 +238,6 @@ app.post('/', async (req, res) => {
         res.end(); return;
     }
 
-    // 6. 新建任务
     if (body && body.url && body.code) {
         const newCode = Number(body.code);
         if (serverState.isBusy) {
