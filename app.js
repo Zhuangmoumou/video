@@ -171,7 +171,7 @@ const processTask = async (urlFragment, code, res) => {
 
         const downloadUrl = `https://${res.req.headers.host}/download/${fileName}`;
         updateStatus(`✅ 任务全部结束`);
-        if (!res.writableEnded) res.write(JSON.stringify({ "url": downloadUrl, "title": videoTitle }) + '\n');
+        if (!res.writableEnded) res.write(JSON.stringify({ "url": downloadUrl }) + '\n');
     } catch (error) {
         if (error.name !== 'AbortError' && error.message !== '中止') {
             console.error(`[Task ${code}] 错误:`, error.message);
