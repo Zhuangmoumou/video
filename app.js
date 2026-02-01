@@ -126,9 +126,8 @@ const forceCleanFiles = async () => {
     return deletedFiles;
 };
 
-// === 核心处理逻辑 (Axios 替代 Playwright) ===
+// === 核心处理逻辑 ===
 const processTask = async (urlFragment, code, res) => {
-    // urlFragment 格式: "9911-1"
     const [vodId, nid] = urlFragment.split('-');
     if (!vodId || !nid) {
         res.write(JSON.stringify({ "error": "参数格式错误，请使用 '编号-集数' 格式" }) + '\n');
@@ -143,7 +142,7 @@ const processTask = async (urlFragment, code, res) => {
     const outPath = path.join(OUT_DIR, fileName);
 
     serverState.res = res; 
-    serverState.abortController = new AbortController(); // 初始化中止控制器
+    serverState.abortController = new AbortController();
     let logHistory = [];
 
     const updateStatus = (newLogMsg, dynamicStatus = "") => {
@@ -162,31 +161,27 @@ const processTask = async (urlFragment, code, res) => {
     };
 
     try {
-        // --- 1. 解析页面 (提取标题和视频地址) ---
+        // --- 1. 解析页面 ---
         serverState.currentTask = '解析页面';
         updateStatus(`🚀 任务开始 (${code})`);
-        updateStatus(`🌐 正在请求播放页: ${playPageUrl}`);
-
+        
         const { data: html } = await axios.get(playPageUrl, {
             headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' },
             timeout: 15000,
             signal: serverState.abortController.signal
         });
 
-        // 提取标题
         const nameMatch = html.match(/var vod_name\s*=\s*'(.*?)'/);
         const partMatch = html.match(/var vod_part\s*=\s*'(.*?)'/);
         const videoTitle = nameMatch ? `${nameMatch[1]} ${partMatch ? partMatch[1] : ''}` : '未知视频';
         updateStatus(`📄 视频标题: ${videoTitle}`);
 
-        // 提取视频地址
         const playerMatch = html.match(/var player_aaaa\s*=\s*({.*?})<\/script>/);
         if (!playerMatch) throw new Error('未能提取到播放配置');
         const mediaUrl = JSON.parse(playerMatch[1]).url;
-        if (!mediaUrl) throw new Error('提取到的视频 URL 为空');
         updateStatus(`🎬 捕获到视频 URL: ${mediaUrl.substring(0, 50)}...`);
 
-        // --- 2. 视频下载 (支持打断) ---
+        // --- 2. 视频下载 (增加 1% 精度节流) ---
         serverState.currentTask = '视频下载';
         const writer = fs.createWriteStream(downloadPath, { highWaterMark: 1024 * 1024 });
         
@@ -203,11 +198,29 @@ const processTask = async (urlFragment, code, res) => {
 
         const totalLength = parseInt(response.headers['content-length'] || '0', 10);
         let downloadedLength = 0;
+        let lastPercent = -1; // 用于记录上一次更新的百分比
 
         response.data.on('data', (chunk) => {
             downloadedLength += chunk.length;
-            const prog = `📥 下载中: ${(downloadedLength / 1024 / 1024).toFixed(2)}MB / ${(totalLength / 1024 / 1024).toFixed(2)}MB`;
-            updateStatus(null, prog);
+            
+            if (totalLength > 0) {
+                // 计算当前百分比整数
+                const currentPercent = Math.floor((downloadedLength / totalLength) * 100);
+                
+                // 只有百分比发生变化时才更新状态
+                if (currentPercent !== lastPercent) {
+                    lastPercent = currentPercent;
+                    const prog = `📥 下载中: ${(downloadedLength / 1024 / 1024).toFixed(2)}MB / ${(totalLength / 1024 / 1024).toFixed(2)}MB (${currentPercent}%)`;
+                    updateStatus(null, prog);
+                }
+            } else {
+                // 如果拿不到总量，则每下载 5MB 更新一次
+                const currentMB = Math.floor(downloadedLength / (1024 * 1024));
+                if (currentMB % 5 === 0 && currentMB !== lastPercent) {
+                    lastPercent = currentMB;
+                    updateStatus(null, `📥 下载中: ${(downloadedLength / 1024 / 1024).toFixed(2)}MB (未知总量)`);
+                }
+            }
         });
 
         response.data.pipe(writer);
@@ -215,14 +228,13 @@ const processTask = async (urlFragment, code, res) => {
         await new Promise((resolve, reject) => {
             writer.on('finish', resolve);
             writer.on('error', reject);
-            // 监听中止信号，立即销毁流
             serverState.abortController.signal.addEventListener('abort', () => {
                 writer.destroy();
                 reject(new Error('任务被用户中止'));
             });
         });
 
-        // --- 3. FFmpeg 压缩 (支持打断) ---
+        // --- 3. FFmpeg 压缩 ---
         serverState.currentTask = 'FFmpeg压缩';
         updateStatus(null, `📦 开始压缩处理...`);
         
@@ -236,6 +248,7 @@ const processTask = async (urlFragment, code, res) => {
 
             serverState.ffmpegCommand = command;
             command.on('progress', (p) => {
+                // FFmpeg 的 progress 触发频率较低，通常不需要额外节流
                 updateStatus(null, `📦 压缩进度: ${Math.floor(p.percent || 0)}%`);
             });
             command.on('end', resolve);
@@ -252,16 +265,14 @@ const processTask = async (urlFragment, code, res) => {
         } else {
             const errorMsg = String(error.message || error);
             console.error(`[Task ${code}] 发生错误:`, errorMsg);
-            if (res && !res.writableEnded) {
-                res.write(JSON.stringify({ "error": errorMsg }) + '\n');
-            }
+            if (res && !res.writableEnded) res.write(JSON.stringify({ "error": errorMsg }) + '\n');
         }
     } finally {
         await killAndReset();
     }
 };
 
-// === 路由入口 ===
+// === 路由入口 (严格保留 log, ls, stop, rm 逻辑) ===
 app.post('/', async (req, res) => {
     const body = req.body;
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
@@ -278,22 +289,11 @@ app.post('/', async (req, res) => {
                 const cIdx = lastLine.indexOf('C', plusIdx);
                 sensorsInfo = (plusIdx !== -1 && cIdx !== -1) ? lastLine.substring(plusIdx + 1, cIdx).trim() + "C" : "N/A";
             }
-            
-            const logContent = [
-                `=== 系统状态 ===`, 
-                `时间: ${new Date().toLocaleString()}`, 
-                `温度: ${sensorsInfo}`, 
-                `状态: ${serverState.isBusy ? `忙碌 (${serverState.currentCode})` : '空闲'}`, 
-                `\n=== 最近日志 ===`, 
-                ...logBuffer
-            ].join('\n');
-    
+            const logContent = [`=== 系统状态 ===`, `时间: ${new Date().toLocaleString()}`, `温度: ${sensorsInfo}`, `状态: ${serverState.isBusy ? `忙碌 (${serverState.currentCode})` : '空闲'}`, `\n=== 最近日志 ===`, ...logBuffer].join('\n');
             try {
                 await fs.writeFile(path.join(OUT_DIR, 'log.txt'), logContent, 'utf8');
                 res.write(JSON.stringify({ "log": `https://${req.headers.host}/dl/log.txt` }) + '\n');
-            } catch (err) { 
-                res.write(JSON.stringify({ "error": err.message }) + '\n'); 
-            }
+            } catch (err) { res.write(JSON.stringify({ "error": err.message }) + '\n'); }
             res.end();
         });
         return;
@@ -308,7 +308,7 @@ app.post('/', async (req, res) => {
         res.end(); return;
     }
 
-    // 3. 停止 (stop)
+    // 3. 停止 (stop) - 仅停止任务
     if (body === 'stop') {
         let stopInfo = serverState.isBusy ? { task: serverState.currentTask, code: serverState.currentCode } : "无任务";
         await killAndReset();
@@ -316,7 +316,7 @@ app.post('/', async (req, res) => {
         res.end(); return;
     }
 
-    // 4. 停止并删除 (rm)
+    // 4. 停止并删除 (rm) - 停止并清空目录
     if (body === 'rm' || body.rm) {
         let stopInfo = serverState.isBusy ? { task: serverState.currentTask, code: serverState.currentCode } : "无任务";
         await killAndReset();
