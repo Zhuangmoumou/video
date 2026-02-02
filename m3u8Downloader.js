@@ -1,83 +1,71 @@
-const axios = require('axios');
-const fs = require('fs-extra');
+const ffmpeg = require('fluent-ffmpeg');
 
 /**
- * 路径解析工具
- */
-function resolveUrl(baseUrl, relativeUrl) {
-    return new URL(relativeUrl, baseUrl).href;
-}
-
-/**
- * 手动解析并下载 M3U8
+ * 使用 FFmpeg 下载 M3U8，确保音频平滑且进度精确
  */
 async function downloadM3u8(m3u8Url, savePath, options = {}) {
     const { signal, onProgress, headers = {} } = options;
 
-    try {
-        // 1. 获取 M3U8 内容
-        const response = await axios.get(m3u8Url, { headers, signal, timeout: 10000 });
-        const content = response.data;
-        const currentBaseUrl = m3u8Url;
+    // 将 headers 对象转换为 FFmpeg 要求的字符串格式
+    const headerString = Object.entries(headers)
+        .map(([key, value]) => `${key}: ${value}`)
+        .join('\r\n') + '\r\n';
 
-        // 2. 处理嵌套 M3U8 (Master Playlist)
-        if (content.includes('#EXT-X-STREAM-INF')) {
-            const lines = content.split('\n');
-            const subM3u8 = lines.find(l => l.trim() && !l.startsWith('#'));
-            if (subM3u8) {
-                const nextUrl = resolveUrl(currentBaseUrl, subM3u8.trim());
-                return downloadM3u8(nextUrl, savePath, options);
-            }
-        }
+    return new Promise((resolve, reject) => {
+        let lastPercent = -1; // 记录上一次发送的进度
 
-        // 3. 解析所有 TS 片段链接
-        const tsUrls = content.split('\n')
-            .filter(l => l.trim() && !l.startsWith('#'))
-            .map(l => resolveUrl(currentBaseUrl, l.trim()));
+        const command = ffmpeg(m3u8Url)
+            .inputOptions([
+                '-headers', headerString,
+                '-protocol_whitelist', 'file,http,https,tcp,tls'
+            ])
+            .outputOptions([
+                '-c', 'copy',              // 下载阶段仅拷贝，不重编码
+                '-bsf:a', 'aac_adtstoasc' // 修复音频封装
+            ])
+            .on('progress', (progress) => {
+                // 仅当 FFmpeg 能够计算出百分比时执行
+                if (progress.percent !== undefined && progress.percent !== null) {
+                    // 取整，确保精度为 1%
+                    let currentPercent = Math.floor(progress.percent);
 
-        const total = tsUrls.length;
-        if (total === 0) throw new Error('未找到有效的视频片段');
+                    // 限制范围在 0-100 之间（FFmpeg 有时会输出微小的负数或略超 100）
+                    if (currentPercent < 0) currentPercent = 0;
+                    if (currentPercent > 100) currentPercent = 100;
 
-        // 4. 顺序下载并写入文件
-        const outputStream = fs.createWriteStream(savePath);
-        let finished = 0;
-        let lastPercent = -1;
+                    // 核心逻辑：只有当前进度大于上一次记录的进度时，才触发更新
+                    if (currentPercent > lastPercent) {
+                        lastPercent = currentPercent;
+                        if (onProgress) {
+                            onProgress(currentPercent);
+                        }
+                    }
+                }
+            })
+            .on('end', () => {
+                // 确保结束时进度达到 100%
+                if (lastPercent < 100 && onProgress) onProgress(100);
+                resolve();
+            })
+            .on('error', (err) => {
+                // 忽略由手动杀掉进程引起的错误
+                if (err.message.includes('SIGKILL') || err.message.includes('ffmpeg was killed')) {
+                    return;
+                }
+                reject(err);
+            })
+            .save(savePath);
 
-        for (let i = 0; i < tsUrls.length; i++) {
-            // 检查是否被用户中止
-            if (signal?.aborted) {
-                outputStream.destroy();
-                throw new Error('中止');
-            }
-
-            const tsUrl = tsUrls[i];
-            const res = await axios.get(tsUrl, {
-                headers,
-                responseType: 'arraybuffer',
-                signal,
-                timeout: 30000
+        // 处理外部中止信号
+        if (signal) {
+            signal.addEventListener('abort', () => {
+                try {
+                    command.kill('SIGKILL');
+                } catch (e) {}
+                reject(new Error('中止'));
             });
-
-            outputStream.write(Buffer.from(res.data));
-            finished++;
-
-            // --- 进度节流逻辑 ---
-            const currentPercent = Math.floor((finished / total) * 100);
-            if (currentPercent !== lastPercent) {
-                lastPercent = currentPercent;
-                if (onProgress) onProgress(currentPercent);
-            }
         }
-
-        return new Promise((resolve, reject) => {
-            outputStream.end();
-            outputStream.on('finish', resolve);
-            outputStream.on('error', reject);
-        });
-
-    } catch (error) {
-        throw error;
-    }
+    });
 }
 
 module.exports = { downloadM3u8 };
