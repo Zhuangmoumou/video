@@ -1,3 +1,5 @@
+--- START OF FILE app.js ---
+
 const express = require('express');
 const ffmpeg = require('fluent-ffmpeg');
 const axios = require('axios');
@@ -136,11 +138,12 @@ const processTask = async (urlFragment, code, res) => {
 
         if (mediaUrl.includes('.m3u8')) {
             serverState.currentTask = 'M3U8下载';
-            updateStatus(`📦 检测到 M3U8，启动解析下载...`);
+            updateStatus(`📦 检测到 M3U8，启动分片下载与音频修复...`);
+            // 使用新的下载器逻辑，它会自动处理分片下载、合并和音频声道修复
             await downloadM3u8(mediaUrl, downloadPath, {
                 signal: serverState.abortController.signal,
                 headers: { 'Referer': 'https://omofun01.xyz/' },
-                onProgress: (p) => updateStatus(null, `📥 M3U8下载进度: ${p}%`)
+                onProgress: (p, msg) => updateStatus(null, `📥 M3U8处理: ${p}% ${msg ? `(${msg})` : ''}`)
             });
         } else {
             serverState.currentTask = '视频下载';
@@ -161,12 +164,24 @@ const processTask = async (urlFragment, code, res) => {
         }
 
         serverState.currentTask = 'FFmpeg压缩';
-        updateStatus(null, `📦 开始压缩处理...`);
+        updateStatus(null, `📦 开始最终压缩处理...`);
         await new Promise((resolve, reject) => {
-            const command = ffmpeg(downloadPath).outputOptions(['-vf', 'scale=320:170:force_original_aspect_ratio=decrease,pad=320:170:(ow-iw)/2:(oh-ih)/2', '-c:v', 'libx264', '-crf', '17', '-preset', 'medium', '-c:a', 'copy']).save(outPath);
+            // 注意：这里使用 -c:a copy，因为 M3U8 下载器已经修复了音频并转码为 AAC
+            // 如果是直连 MP4，通常也是 AAC，直接复制即可
+            const command = ffmpeg(downloadPath)
+                .outputOptions([
+                    '-vf', 'scale=320:170:force_original_aspect_ratio=decrease,pad=320:170:(ow-iw)/2:(oh-ih)/2',
+                    '-c:v', 'libx264',
+                    '-crf', '17',
+                    '-preset', 'medium',
+                    '-c:a', 'copy' 
+                ])
+                .save(outPath);
+            
             serverState.ffmpegCommand = command;
             command.on('progress', (p) => updateStatus(null, `📦 压缩进度: ${Math.floor(p.percent || 0)}%`));
-            command.on('end', resolve); command.on('error', reject);
+            command.on('end', resolve); 
+            command.on('error', reject);
         });
 
         const downloadUrl = `https://${res.req.headers.host}/dl/${fileName}`;
