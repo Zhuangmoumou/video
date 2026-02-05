@@ -95,7 +95,7 @@ const processTask = async (urlFragment, code, res) => {
         res.end(); serverState.isBusy = false; return;
     }
 
-    const playPageUrl = `https://dm.xifanacg.com/watch/${vodId}/${sid}/${nid}.html`;
+    const playPageUrl = `https://omofun01.xyz/vod/play/id/${vodId}/sid/${sid}/nid/${nid}.html`;
     const fileName = `${urlFragment}.mp4`;
     const downloadPath = path.join(ROOT_DIR, fileName);
     const outPath = path.join(OUT_DIR, fileName);
