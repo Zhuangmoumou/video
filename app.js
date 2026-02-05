@@ -84,6 +84,7 @@ const forceCleanFiles = async () => {
     return ["All files cleaned"];
 };
 
+
 // === 核心处理逻辑 ===
 const processTask = async (urlFragment, code, res) => {
     const parts = urlFragment.split('-');
@@ -131,27 +132,51 @@ const processTask = async (urlFragment, code, res) => {
 
         const playerMatch = html.match(/var player_aaaa\s*=\s*({.*?})<\/script>/);
         if (!playerMatch) throw new Error('未能提取到播放配置');
-        const mediaUrl = JSON.parse(playerMatch[1]).url;
-        updateStatus(`🎬 捕获到 URL: ${mediaUrl.substring(0, 60)}...`);
+        
+        let mediaUrl = JSON.parse(playerMatch[1]).url;
+
+        // 【修改点 1】: 如果是 MP4 资源，替换 URL 协议头
+        if (mediaUrl.toLowerCase().includes('.mp4')) {
+            mediaUrl = mediaUrl.replace('https://', 'https://p.bsgm.us.kg/p/https/');
+            updateStatus(`🔗 检测到 MP4，已应用代理: ${mediaUrl.substring(0, 60)}...`);
+        } else {
+            updateStatus(`🎬 捕获到 URL: ${mediaUrl.substring(0, 60)}...`);
+        }
 
         if (mediaUrl.includes('.m3u8')) {
             serverState.currentTask = 'M3U8下载';
-            updateStatus(`📦 检测到 M3U8，启动解析下载...`);
+            updateStatus(`📦 检测到 M3U8，启动 FFmpeg 下载...`);
+            
+            // 【修改点 2】: 调用更新后的 downloadM3u8，传入进度和大小显示
             await downloadM3u8(mediaUrl, downloadPath, {
                 signal: serverState.abortController.signal,
-                headers: { 'Referer': 'https://omofun01.xyz/' },
-                onProgress: (p) => updateStatus(null, `📥 M3U8下载进度: ${p}%`)
+                headers: { 'Referer': 'https://omofun01.xyz/', 'User-Agent': 'Mozilla/5.0' },
+                onProgress: (percent, size) => {
+                    const progressText = percent ? `${percent}%` : '计算中...';
+                    updateStatus(null, `📥 M3U8下载进度: ${progressText} [已下载: ${size}]`);
+                }
             });
         } else {
+            // MP4 下载逻辑保持不变
             serverState.currentTask = '视频下载';
             const writer = fs.createWriteStream(downloadPath);
-            const response = await axios({ url: mediaUrl, method: 'GET', responseType: 'stream', signal: serverState.abortController.signal, headers: { 'Referer': 'https://omofun01.xyz/' } });
+            const response = await axios({ 
+                url: mediaUrl, 
+                method: 'GET', 
+                responseType: 'stream', 
+                signal: serverState.abortController.signal, 
+                headers: { 'Referer': 'https://omofun01.xyz/' } 
+            });
             const totalLength = parseInt(response.headers['content-length'] || '0', 10);
             let downloadedLength = 0, lastPercent = -1;
             response.data.on('data', (chunk) => {
                 downloadedLength += chunk.length;
                 const currentPercent = totalLength ? Math.floor((downloadedLength / totalLength) * 100) : -1;
-                if (currentPercent !== lastPercent && currentPercent !== -1) { lastPercent = currentPercent; updateStatus(null, `📥 下载中: ${currentPercent}%`); }
+                const sizeMB = (downloadedLength / 1024 / 1024).toFixed(2);
+                if (currentPercent !== lastPercent && currentPercent !== -1) { 
+                    lastPercent = currentPercent; 
+                    updateStatus(null, `📥 下载中: ${currentPercent}% [已下载: ${sizeMB}MB]`); 
+                }
             });
             response.data.pipe(writer);
             await new Promise((resolve, reject) => {
@@ -160,25 +185,37 @@ const processTask = async (urlFragment, code, res) => {
             });
         }
 
+        // 后续 FFmpeg 压缩逻辑保持不变
         serverState.currentTask = 'FFmpeg压缩';
         updateStatus(null, `📦 开始压缩处理...`);
         await new Promise((resolve, reject) => {
-            const command = ffmpeg(downloadPath).outputOptions(['-vf', 'scale=320:170:force_original_aspect_ratio=decrease,pad=320:170:(ow-iw)/2:(oh-ih)/2', '-c:v', 'libx264', '-crf', '17', '-preset', 'medium', '-c:a', 'copy']).save(outPath);
+            const command = ffmpeg(downloadPath)
+                .outputOptions([
+                    '-vf', 'scale=320:170:force_original_aspect_ratio=decrease,pad=320:170:(ow-iw)/2:(oh-ih)/2', 
+                    '-c:v', 'libx264', 
+                    '-crf', '17', 
+                    '-preset', 'medium', 
+                    '-c:a', 'copy'
+                ])
+                .save(outPath);
             serverState.ffmpegCommand = command;
             command.on('progress', (p) => updateStatus(null, `📦 压缩进度: ${Math.floor(p.percent || 0)}%`));
-            command.on('end', resolve); command.on('error', reject);
+            command.on('end', resolve); 
+            command.on('error', reject);
         });
 
         const downloadUrl = `https://${res.req.headers.host}/dl/${fileName}`;
         updateStatus(`✅ 任务全部结束`);
         if (!res.writableEnded) res.write(JSON.stringify({ "url": downloadUrl }) + '\n');
     } catch (error) {
+        // ... 错误处理保持不变 ...
         if (error.name !== 'AbortError' && error.message !== '中止') {
             console.error(`[Task ${code}] 错误:`, error.message);
             if (res && !res.writableEnded) res.write(JSON.stringify({ "error": error.message }) + '\n');
         }
     } finally { await killAndReset(); }
 };
+
 
 // === 路由入口 (保持不变) ===
 app.post('/', async (req, res) => {
