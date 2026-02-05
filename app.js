@@ -89,13 +89,13 @@ const processTask = async (urlFragment, code, res) => {
     const parts = urlFragment.split('-');
     let vodId, sid, nid;
     if (parts.length === 3) [vodId, sid, nid] = parts;
-    else if (parts.length === 2) { [vodId, nid] = parts; sid = '5'; }
+    else if (parts.length === 2) { [vodId, nid] = parts; sid = '1'; }
     else {
         res.write(JSON.stringify({ "error": "格式错误" }) + '\n');
         res.end(); serverState.isBusy = false; return;
     }
 
-    const playPageUrl = `https://omofun01.xyz/vod/play/id/${vodId}/sid/${sid}/nid/${nid}.html`;
+    const playPageUrl = `https://dm.xifanacg.com/watch/${vodId}/${sid}/${nid}.html`;
     const fileName = `${urlFragment}.mp4`;
     const downloadPath = path.join(ROOT_DIR, fileName);
     const outPath = path.join(OUT_DIR, fileName);
