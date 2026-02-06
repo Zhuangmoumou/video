@@ -42,7 +42,7 @@ jobs:
       # 5. 安装 npm 依赖
       - name: Install npm dependencies
         run: |
-          npm install express fluent-ffmpeg axios fs-extra playerwright
+          npm install express fluent-ffmpeg axios fs-extra playwright
 
       # 6. 安装 Playwright 所需的浏览器内核及系统依赖 (无头 Chrome)
       - name: Install Playwright Browsers
