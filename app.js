@@ -316,6 +316,18 @@ app.post('/', async (req, res) => {
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
     res.setHeader('Transfer-Encoding', 'chunked');
 
+    // --- 新增：处理短代码格式 9911-5-1 ---
+    if (body && body.url && typeof body.url === 'string') {
+        const shortCodeMatch = body.url.match(/^(\d+)-(\d+)-(\d+)$/);
+        if (shortCodeMatch) {
+            const [_, id, sid, nid] = shortCodeMatch;
+            body.url = `https://omofun01.xyz/vod/play/id/${id}/sid/${sid}/nid/${nid}.html`;
+            // 如果没有传 code，则自动生成一个 code
+            if (!body.code) body.code = `${id}${sid}${nid}`;
+        }
+    }
+    // ------------------------------------
+
     // LOG
     if (body === 'log' || (body && body.log)) {
         const logContent = [`=== 系统状态 ===`, `状态: ${serverState.isBusy ? `忙碌 (${serverState.currentCode})` : '空闲'}`, `\n=== 日志 ===`, ...logBuffer].join('\n');
