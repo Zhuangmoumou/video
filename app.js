@@ -114,12 +114,13 @@ const processTask = async (urlFragment, code, res) => {
     try {
         serverState.currentTask = '浏览器解析';
         updateStatus(`🚀 任务开始 (${code})`);
+        updateStatus(null, "🌏 正在打开浏览器");
         const browser = await chromium.launch({ headless: true });
         serverState.browser = browser;
         let mediaUrl = null;
         try {
             const page = await browser.newPage();
-            updateStatus(`🌐 正在打开页面: ${fullUrl}`);
+            updateStatus(`🌐 打开页面: ${fullUrl}`);
             const findMediaPromise = new Promise((resolve) => {
                 page.on('response', (response) => {
                     const url = response.url();
@@ -128,6 +129,8 @@ const processTask = async (urlFragment, code, res) => {
                 });
             });
             await page.goto(fullUrl, { waitUntil: 'domcontentloaded', timeout: 40000 });
+            const pageTitle = await page.title().catch(() => '未知标题');
+            updateStatus(`📄 页面标题: ${pageTitle}`); 
             mediaUrl = await Promise.race([findMediaPromise, new Promise((_, r) => setTimeout(() => r(new Error('嗅探超时')), 30000))]);
         } finally { await browser.close(); serverState.browser = null; }
 
@@ -166,7 +169,7 @@ const processTask = async (urlFragment, code, res) => {
             cmd.on('progress', (p) => updateStatus(null, `📦 压缩: ${Math.floor(p.percent || 0)}%`));
             cmd.on('end', resolve); cmd.on('error', reject);
         });
-
+        updateStuatus("✅ 所有任务完成\n\n");
         if (!res.writableEnded) res.write(JSON.stringify({ "url": `https://${res.req.headers.host}/dl/${fileName}` }) + '\n');
     } catch (error) {
         if (res && !res.writableEnded) res.write(JSON.stringify({ "error": error.message }) + '\n');
