@@ -7,9 +7,12 @@ const path = require('path');
  * 辅助函数：解析 M3U8 获取总时长 (秒)
  * 用于计算下载进度百分比
  */
-async function getM3u8Duration(url) {
+async function getM3u8Duration(url, headers) {
     try {
-        const response = await axios.get(url, { timeout: 10000 });
+        const response = await axios.get(url, { 
+            headers, 
+            timeout: 10000 
+        });
         const content = response.data;
         let totalDuration = 0;
         
@@ -47,29 +50,59 @@ function parseTimemark(timemark) {
 }
 
 /**
- * 极简版 M3U8 下载
- * 对应命令: ffmpeg -i [URL] -c copy -bsf:a aac_adtstoasc [FILE]
+ * 使用 FFmpeg 直接下载 M3U8 (带防盗链 Headers)
  */
 async function downloadM3u8(m3u8Url, savePath, options = {}) {
-    const { signal, onProgress } = options;
+    const { signal, onProgress, headers = {} } = options;
     
-    // 1. 获取时长用于进度计算
+    // 1. 获取时长 (带 Headers 请求)
     let totalDuration = 0;
     if (onProgress) {
-        onProgress(0, '正在连接...');
-        totalDuration = await getM3u8Duration(m3u8Url);
+        onProgress(0, '正在连接并分析流信息...');
+        totalDuration = await getM3u8Duration(m3u8Url, headers);
+    }
+
+    // 2. 构造 inputOptions
+    // 分离 User-Agent 和其他 Headers
+    let userAgent = 'Mozilla/5.0';
+    let headerLines = [];
+
+    for (const [key, val] of Object.entries(headers)) {
+        if (key.toLowerCase() === 'user-agent') {
+            userAgent = val;
+        } else {
+            headerLines.push(`${key}: ${val}`);
+        }
+    }
+
+    // 基础参数
+    const inputOptions = [
+        '-user_agent', userAgent,                   // 单独设置 UA
+        '-protocol_whitelist', 'file,http,https,tcp,tls,crypto,data', // 关键：允许所有协议
+        '-reconnect', '1',
+        '-reconnect_streamed', '1',
+        '-reconnect_delay_max', '10',
+        '-rw_timeout', '30000000',                  // 15秒网络超时
+        '-allowed_extensions', 'ALL'
+    ];
+
+    // 添加 Headers (如果有)
+    // 格式：Key: Value\r\nKey: Value
+    if (headerLines.length > 0) {
+        const headersStr = headerLines.join('\r\n') + '\r\n';
+        inputOptions.push('-headers', headersStr);
     }
 
     return new Promise((resolve, reject) => {
         // 确保目录存在
         fs.ensureDirSync(path.dirname(savePath));
 
-        // 构建 FFmpeg 命令
         const command = ffmpeg(m3u8Url)
+            .inputOptions(inputOptions)
             .outputOptions([
-                '-y',                       // 强制覆盖输出文件 (必须，否则文件存在时会报错)
-                '-c', 'copy',               // 视频音频直接流复制
-                '-bsf:a', 'aac_adtstoasc',   // 修复 M3U8->MP4 音频流
+                '-y',                       // 强制覆盖
+                '-c', 'copy',               // 直接流复制
+                '-bsf:a', 'aac_adtstoasc',  // 修复音频
                 '-movflags', 'faststart'
             ]);
 
@@ -118,7 +151,6 @@ async function downloadM3u8(m3u8Url, savePath, options = {}) {
             }
         });
 
-        // 支持任务中止
         if (signal) {
             signal.addEventListener('abort', () => {
                 command.kill('SIGKILL');
