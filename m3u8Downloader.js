@@ -5,22 +5,18 @@ const path = require('path');
 
 /**
  * 辅助函数：解析 M3U8 获取总时长 (秒)
- * 用于计算下载进度百分比
  */
 async function getM3u8Duration(url) {
     try {
         const response = await axios.get(url, { timeout: 10000 });
         const content = response.data;
         let totalDuration = 0;
-        
         const lines = content.split('\n');
         for (const line of lines) {
             if (line.trim().startsWith('#EXTINF:')) {
                 const durationStr = line.split(':')[1].split(',')[0];
                 const duration = parseFloat(durationStr);
-                if (!isNaN(duration)) {
-                    totalDuration += duration;
-                }
+                if (!isNaN(duration)) totalDuration += duration;
             }
         }
         return totalDuration;
@@ -30,12 +26,11 @@ async function getM3u8Duration(url) {
 }
 
 /**
- * 辅助函数：将 timemark (00:01:23.45) 转换为秒
+ * 辅助函数：将 timemark 转换为秒
  */
 function parseTimemark(timemark) {
     if (typeof timemark === 'number') return timemark;
     if (!timemark) return 0;
-    
     const parts = timemark.split(':');
     let seconds = 0;
     if (parts.length === 3) {
@@ -47,7 +42,7 @@ function parseTimemark(timemark) {
 }
 
 /**
- * 使用 FFmpeg 直接下载 M3U8 (无 Header 版 + 强制覆盖)
+ * 使用 FFmpeg 直接下载 M3U8
  */
 async function downloadM3u8(m3u8Url, savePath, options = {}) {
     const { signal, onProgress } = options;
@@ -59,35 +54,45 @@ async function downloadM3u8(m3u8Url, savePath, options = {}) {
         totalDuration = await getM3u8Duration(m3u8Url);
     }
 
-    return new Promise((resolve, reject) => {
-        // 确保输出目录存在
-        try {
-            fs.ensureDirSync(path.dirname(savePath));
-        } catch (e) {
-            return reject(new Error(`无法创建目录: ${e.message}`));
+    // 2. 准备目录和清理旧文件
+    try {
+        const dir = path.dirname(savePath);
+        await fs.ensureDir(dir);
+        if (await fs.pathExists(savePath)) {
+            await fs.remove(savePath); // 显式删除，避免占用
         }
+    } catch (e) {
+        throw new Error(`文件系统错误: ${e.message}`);
+    }
 
+    return new Promise((resolve, reject) => {
         const command = ffmpeg(m3u8Url)
             .inputOptions([
+                // 关键修复：允许所有常用协议，防止因 crypto/https 被拦截导致报错
+                '-protocol_whitelist', 'file,http,https,tcp,tls,crypto,data',
                 '-reconnect', '1',
                 '-reconnect_streamed', '1',
                 '-reconnect_delay_max', '10',
-                '-rw_timeout', '15000000',
+                '-rw_timeout', '15000000', // 15秒超时
                 '-allowed_extensions', 'ALL'
             ])
             .outputOptions([
-                '-y',                   // <--- 关键修复：强制覆盖已存在的文件
-                '-c', 'copy',           // 视频音频直接流复制
-                '-bsf:a', 'aac_adtstoasc', 
+                '-y',                   // 覆盖输出
+                '-c', 'copy',           // 直接复制流
+                '-bsf:a', 'aac_adtstoasc', // 修复音频流
                 '-movflags', 'faststart'
             ]);
 
         let lastPercent = -1;
 
-        // 监听进度
+        // 调试：输出生成的命令，方便排查
+        command.on('start', (cmdLine) => {
+            console.log('[FFmpeg Command]', cmdLine);
+        });
+
         command.on('progress', (progress) => {
             if (!onProgress) return;
-
+            
             let currentSizeMB = '0.00';
             if (progress.targetSize) {
                 currentSizeMB = (progress.targetSize / 1024).toFixed(2);
@@ -117,11 +122,19 @@ async function downloadM3u8(m3u8Url, savePath, options = {}) {
         });
 
         command.on('error', (err) => {
+            // 过滤掉中止信号导致的错误
             if (err.message.includes('SIGKILL') || (signal && signal.aborted)) {
                 reject(new Error('中止'));
             } else {
-                const simpleErr = err.message.split('\n')[0];
-                reject(new Error(`FFmpeg下载出错: ${simpleErr}`));
+                // 提取简短错误信息
+                let msg = err.message;
+                // 尝试提取 ffmpeg 的具体 stderr 输出
+                if (msg.includes('ffmpeg exited with code')) {
+                   // 很多时候 fluent-ffmpeg 的 error 对象没有包含详细的 stderr
+                   // 这里保留原始消息以便调试
+                   msg = `FFmpeg Error: ${msg}`;
+                }
+                reject(new Error(msg));
             }
         });
 
