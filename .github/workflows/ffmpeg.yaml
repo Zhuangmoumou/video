@@ -42,12 +42,12 @@ jobs:
       # 5. 安装 npm 依赖
       - name: Install npm dependencies
         run: |
-          npm install express fluent-ffmpeg axios fs-extra @lzwme/m3u8-dl
+          npm install express fluent-ffmpeg axios fs-extra playerwright
 
       # 6. 安装 Playwright 所需的浏览器内核及系统依赖 (无头 Chrome)
-      # - name: Install Playwright Browsers
-        # run: |
-          # npx playwright install chromium --with-deps
+       - name: Install Playwright Browsers
+         run: |
+           npx playwright install chromium --with-deps
 
       # 7. 启动隧道
       - name: Start Tunnel

@@ -2,164 +2,200 @@ const ffmpeg = require('fluent-ffmpeg');
 const axios = require('axios');
 const fs = require('fs-extra');
 const path = require('path');
+const { URL } = require('url');
 
 /**
- * 辅助函数：解析 M3U8 获取总时长 (秒)
- * 用于计算下载进度百分比
+ * 辅助：将相对路径转换为绝对URL
  */
-async function getM3u8Duration(url, headers) {
+function resolveUrl(baseUrl, relativeUrl) {
+    if (relativeUrl.startsWith('http')) return relativeUrl;
+    return new URL(relativeUrl, baseUrl).href;
+}
+
+/**
+ * 辅助：下载单个文件 (TS片)
+ */
+async function downloadFile(url, dest, headers, retries = 3) {
     try {
-        const response = await axios.get(url, { 
-            headers, 
-            timeout: 10000 
+        const response = await axios({
+            url,
+            method: 'GET',
+            responseType: 'stream',
+            headers,
+            timeout: 30000
         });
-        const content = response.data;
-        let totalDuration = 0;
-        
-        const lines = content.split('\n');
-        for (const line of lines) {
-            if (line.trim().startsWith('#EXTINF:')) {
-                const durationStr = line.split(':')[1].split(',')[0];
-                const duration = parseFloat(durationStr);
-                if (!isNaN(duration)) {
-                    totalDuration += duration;
+        const writer = fs.createWriteStream(dest);
+        response.data.pipe(writer);
+        return new Promise((resolve, reject) => {
+            writer.on('finish', resolve);
+            writer.on('error', reject);
+        });
+    } catch (err) {
+        if (retries > 0) return downloadFile(url, dest, headers, retries - 1);
+        throw err;
+    }
+}
+
+/**
+ * 核心：解析 M3U8 并处理嵌套
+ */
+async function parseM3u8(url, headers) {
+    const res = await axios.get(url, { headers, timeout: 10000 });
+    const content = res.data;
+    const lines = content.split('\n');
+    
+    // 检查是否为嵌套列表 (Master Playlist)
+    if (content.includes('#EXT-X-STREAM-INF')) {
+        let bestBandwidth = 0;
+        let bestUrl = null;
+        for (let i = 0; i < lines.length; i++) {
+            if (lines[i].includes('BANDWIDTH=')) {
+                const bwMatch = lines[i].match(/BANDWIDTH=(\d+)/);
+                const bandwidth = bwMatch ? parseInt(bwMatch[1]) : 0;
+                if (bandwidth > bestBandwidth) {
+                    bestBandwidth = bandwidth;
+                    bestUrl = lines[i+1].trim();
                 }
             }
         }
-        return totalDuration;
-    } catch (e) {
-        return 0;
+        if (bestUrl) {
+            const nextUrl = resolveUrl(url, bestUrl);
+            return parseM3u8(nextUrl, headers); // 递归解析
+        }
     }
-}
 
-/**
- * 辅助函数：将 timemark (00:01:23.45) 转换为秒
- */
-function parseTimemark(timemark) {
-    if (typeof timemark === 'number') return timemark;
-    if (!timemark) return 0;
+    // 解析 TS 列表
+    const tsList = [];
+    let totalDuration = 0;
     
-    const parts = timemark.split(':');
-    let seconds = 0;
-    if (parts.length === 3) {
-        seconds += parseFloat(parts[0]) * 3600;
-        seconds += parseFloat(parts[1]) * 60;
-        seconds += parseFloat(parts[2]);
+    for (let i = 0; i < lines.length; i++) {
+        let line = lines[i].trim();
+        if (line.startsWith('#EXTINF:')) {
+            const dur = parseFloat(line.split(':')[1]);
+            if (!isNaN(dur)) totalDuration += dur;
+            
+            // 下一行通常是 URL，但也可能是其他 tag
+            let nextLine = lines[i+1] ? lines[i+1].trim() : '';
+            while (nextLine.startsWith('#') && i < lines.length - 1) {
+                 i++;
+                 nextLine = lines[i+1] ? lines[i+1].trim() : '';
+            }
+            if (nextLine && !nextLine.startsWith('#')) {
+                tsList.push(resolveUrl(url, nextLine));
+                i++; 
+            }
+        }
     }
-    return seconds;
+    return { tsList, totalDuration };
 }
 
 /**
- * 使用 FFmpeg 直接下载 M3U8 (带防盗链 Headers)
+ * M3U8 下载主函数 (手动解析 + 下载 + 合并)
  */
 async function downloadM3u8(m3u8Url, savePath, options = {}) {
     const { signal, onProgress, headers = {} } = options;
-    
-    // 1. 获取时长 (带 Headers 请求)
-    let totalDuration = 0;
-    if (onProgress) {
-        onProgress(0, '正在连接并分析流信息...');
-        totalDuration = await getM3u8Duration(m3u8Url, headers);
-    }
+    const tempDir = path.join(path.dirname(savePath), `temp_${Date.now()}`);
+    await fs.ensureDir(tempDir);
 
-    // 2. 构造 inputOptions
-    // 分离 User-Agent 和其他 Headers
-    let userAgent = 'Mozilla/5.0';
-    let headerLines = [];
-
-    for (const [key, val] of Object.entries(headers)) {
-        if (key.toLowerCase() === 'user-agent') {
-            userAgent = val;
-        } else {
-            headerLines.push(`${key}: ${val}`);
+    let lastPercent = -1;
+    // 更新进度的限流函数
+    const notifyProgress = (completed, total) => {
+        if (!onProgress) return;
+        const percent = Math.floor((completed / total) * 100);
+        
+        // 只有百分比变化时才回调，精度 1%
+        if (percent !== lastPercent) {
+            lastPercent = percent;
+            // 估算大小 (简单累加文件大小太慢，这里仅计算MB)
+            // 这里我们传递百分比和简单的状态字符串
+            // 在手动下载模式下，我们很难实时获取精确的总大小，除非 head 请求每个 TS
+            // 所以这里先只传进度
+            onProgress(percent, `已下载分片: ${completed}/${total}`, 'calculating...');
         }
-    }
+    };
 
-    // 基础参数
-    const inputOptions = [
-        '-user_agent', userAgent,                   // 单独设置 UA
-        '-protocol_whitelist', 'file,http,https,tcp,tls,crypto,data', // 关键：允许所有协议
-        '-reconnect', '1',
-        '-reconnect_streamed', '1',
-        '-reconnect_delay_max', '10',
-        '-rw_timeout', '30000000',                  // 15秒网络超时
-        '-allowed_extensions', 'ALL'
-    ];
+    try {
+        // 1. 解析
+        if (onProgress) onProgress(0, '正在解析播放列表...', '0 MB');
+        const { tsList } = await parseM3u8(m3u8Url, headers);
+        if (tsList.length === 0) throw new Error('未找到视频分片');
 
-    // 添加 Headers (如果有)
-    // 格式：Key: Value\r\nKey: Value
-    if (headerLines.length > 0) {
-        const headersStr = headerLines.join('\r\n') + '\r\n';
-        inputOptions.push('-headers', headersStr);
-    }
+        // 2. 并发下载
+        const total = tsList.length;
+        let completed = 0;
+        let downloadedBytes = 0; // 累计已下载字节
+        const concurrency = 10;
+        const localFiles = [];
 
-    return new Promise((resolve, reject) => {
-        // 确保目录存在
-        fs.ensureDirSync(path.dirname(savePath));
+        for (let i = 0; i < total; i += concurrency) {
+            if (signal && signal.aborted) throw new Error('中止');
 
-        const command = ffmpeg(m3u8Url)
-            .inputOptions(inputOptions)
-            .outputOptions([
-                '-y',                       // 强制覆盖
-                '-c', 'copy',               // 直接流复制
-                '-bsf:a', 'aac_adtstoasc',  // 修复音频
-                '-movflags', 'faststart'
-            ]);
+            const chunk = tsList.slice(i, i + concurrency);
+            await Promise.all(chunk.map(async (tsUrl, idx) => {
+                const globalIdx = i + idx;
+                const fileName = `${String(globalIdx).padStart(5, '0')}.ts`;
+                const filePath = path.join(tempDir, fileName);
+                localFiles[globalIdx] = filePath;
 
-        let lastPercent = -1;
-
-        // 监听进度
-        command.on('progress', (progress) => {
-            if (!onProgress) return;
-
-            // 获取文件大小
-            let currentSizeMB = '0.00';
-            if (progress.targetSize) {
-                currentSizeMB = (progress.targetSize / 1024).toFixed(2);
-            }
-            
-            let percent = 0;
-            if (totalDuration > 0) {
-                const currentSeconds = parseTimemark(progress.timemark);
-                percent = Math.floor((currentSeconds / totalDuration) * 100);
-                if (percent > 99) percent = 99; 
-            }
-
-            // 只有进度变化时才更新
-            if (percent !== lastPercent) {
-                lastPercent = percent;
-                const sizeInfo = `(已下载: ${currentSizeMB} MB)`;
+                await downloadFile(tsUrl, filePath, headers);
                 
-                if (totalDuration > 0) {
-                    onProgress(percent, `📥 M3U8下载中: ${percent}% ${sizeInfo}`);
-                } else {
-                    onProgress(percent, `📥 M3U8下载中... ${sizeInfo}`);
+                // 统计大小
+                try {
+                    const stat = await fs.stat(filePath);
+                    downloadedBytes += stat.size;
+                } catch(e) {}
+
+                completed++;
+                
+                // 计算大小字符串
+                const sizeMB = (downloadedBytes / 1024 / 1024).toFixed(2) + ' MB';
+                
+                // 这里的 percent 实际上代表“下载阶段”的进度，
+                // 为了给后面的合并留出空间，我们把下载阶段映射到 0-90%
+                const phasePercent = Math.floor((completed / total) * 90);
+                if (phasePercent !== lastPercent) {
+                    lastPercent = phasePercent;
+                    onProgress(phasePercent, `分片下载中 ${completed}/${total}`, sizeMB);
                 }
-            }
-        });
-
-        command.on('end', () => {
-            if (onProgress) onProgress(100, '✅ M3U8下载完成');
-            resolve();
-        });
-
-        command.on('error', (err) => {
-            if (err.message.includes('SIGKILL') || (signal && signal.aborted)) {
-                reject(new Error('中止'));
-            } else {
-                reject(err);
-            }
-        });
-
-        if (signal) {
-            signal.addEventListener('abort', () => {
-                command.kill('SIGKILL');
-                reject(new Error('中止'));
-            });
+            }));
         }
 
-        command.save(savePath);
-    });
+        // 3. 生成列表并合并
+        const fileListPath = path.join(tempDir, 'files.txt');
+        const fileContent = localFiles.map(f => `file '${f}'`).join('\n');
+        await fs.writeFile(fileListPath, fileContent);
+
+        if (onProgress) onProgress(92, '正在合并并修复音频...', '处理中');
+
+        await new Promise((resolve, reject) => {
+            const cmd = ffmpeg()
+                .input(fileListPath)
+                .inputOptions(['-f', 'concat', '-safe', '0'])
+                .outputOptions([
+                    '-c', 'copy',            // 视频流复制
+                    '-bsf:a', 'aac_adtstoasc', // 修复音频
+                    '-y'
+                ])
+                .save(savePath);
+
+            cmd.on('end', resolve);
+            cmd.on('error', reject);
+            if (signal) {
+                signal.addEventListener('abort', () => {
+                    cmd.kill('SIGKILL');
+                    reject(new Error('中止'));
+                });
+            }
+        });
+
+        if (onProgress) onProgress(100, '完成', 'OK');
+
+    } catch (err) {
+        throw err;
+    } finally {
+        // 清理临时目录
+        try { await fs.remove(tempDir); } catch (e) {}
+    }
 }
 
 module.exports = { downloadM3u8 };
