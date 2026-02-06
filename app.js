@@ -79,31 +79,7 @@ let serverState = {
     res: null
 };
 
-// === 辅助函数：清理并重置 ===
-const killAndReset = async () => {
-    console.log('[System] 🗑 正在执行清理并释放资源锁...');
-    
-    // 物理中止
-    if (serverState.browser) { try { await serverState.browser.close(); } catch (e) {} }
-    if (serverState.abortController) { serverState.abortController.abort(); }
-    if (serverState.ffmpegCommand) { try { serverState.ffmpegCommand.kill('SIGKILL'); } catch (e) {} }
 
-    // 任务结束，从全局日志中删掉所有进度行，保持日志整洁
-    logBuffer = logBuffer.filter(line => !line.includes('⏳进度:'));
-
-    serverState.isBusy = false;
-    serverState.currentCode = null;
-    serverState.currentTask = null;
-    serverState.progressStr = null;
-    serverState.abortController = null;
-    serverState.ffmpegCommand = null;
-    serverState.browser = null;
-
-    if (serverState.res && !serverState.res.writableEnded) {
-        serverState.res.end();
-    }
-    serverState.res = null;
-};
 
 // === 辅助函数：清理物理文件 ===
 const forceCleanFiles = async () => {
