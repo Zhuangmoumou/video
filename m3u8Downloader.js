@@ -9,7 +9,6 @@ const path = require('path');
  */
 async function getM3u8Duration(url) {
     try {
-        // 不再传递 headers，只设置超时
         const response = await axios.get(url, { timeout: 10000 });
         const content = response.data;
         let totalDuration = 0;
@@ -17,7 +16,6 @@ async function getM3u8Duration(url) {
         const lines = content.split('\n');
         for (const line of lines) {
             if (line.trim().startsWith('#EXTINF:')) {
-                // 格式通常为 #EXTINF:10.5,
                 const durationStr = line.split(':')[1].split(',')[0];
                 const duration = parseFloat(durationStr);
                 if (!isNaN(duration)) {
@@ -49,12 +47,12 @@ function parseTimemark(timemark) {
 }
 
 /**
- * 使用 FFmpeg 直接下载 M3U8 (无 Header 版)
+ * 使用 FFmpeg 直接下载 M3U8 (无 Header 版 + 强制覆盖)
  */
 async function downloadM3u8(m3u8Url, savePath, options = {}) {
-    const { signal, onProgress } = options; // 忽略 headers 参数
+    const { signal, onProgress } = options;
     
-    // 1. 尝试获取总时长以便显示进度
+    // 1. 尝试获取总时长
     let totalDuration = 0;
     if (onProgress) {
         onProgress(0, '正在分析流媒体信息...');
@@ -63,19 +61,24 @@ async function downloadM3u8(m3u8Url, savePath, options = {}) {
 
     return new Promise((resolve, reject) => {
         // 确保输出目录存在
-        fs.ensureDirSync(path.dirname(savePath));
+        try {
+            fs.ensureDirSync(path.dirname(savePath));
+        } catch (e) {
+            return reject(new Error(`无法创建目录: ${e.message}`));
+        }
 
         const command = ffmpeg(m3u8Url)
             .inputOptions([
                 '-reconnect', '1',
                 '-reconnect_streamed', '1',
                 '-reconnect_delay_max', '10',
-                '-rw_timeout', '15000000', // 网络超时 15秒
+                '-rw_timeout', '15000000',
                 '-allowed_extensions', 'ALL'
             ])
             .outputOptions([
+                '-y',                   // <--- 关键修复：强制覆盖已存在的文件
                 '-c', 'copy',           // 视频音频直接流复制
-                '-bsf:a', 'aac_adtstoasc', // 修复音频流格式
+                '-bsf:a', 'aac_adtstoasc', 
                 '-movflags', 'faststart'
             ]);
 
@@ -85,26 +88,21 @@ async function downloadM3u8(m3u8Url, savePath, options = {}) {
         command.on('progress', (progress) => {
             if (!onProgress) return;
 
-            // 获取当前文件大小 (KB -> MB)
             let currentSizeMB = '0.00';
             if (progress.targetSize) {
                 currentSizeMB = (progress.targetSize / 1024).toFixed(2);
             }
             
             let percent = 0;
-
-            // 计算百分比
             if (totalDuration > 0) {
                 const currentSeconds = parseTimemark(progress.timemark);
                 percent = Math.floor((currentSeconds / totalDuration) * 100);
                 if (percent > 99) percent = 99; 
             }
 
-            // 仅当百分比变化时回调
             if (percent !== lastPercent) {
                 lastPercent = percent;
                 const sizeInfo = `(已下载: ${currentSizeMB} MB)`;
-                
                 if (totalDuration > 0) {
                     onProgress(percent, `📥 M3U8下载中: ${percent}% ${sizeInfo}`);
                 } else {
@@ -127,7 +125,6 @@ async function downloadM3u8(m3u8Url, savePath, options = {}) {
             }
         });
 
-        // 处理中止信号
         if (signal) {
             signal.addEventListener('abort', () => {
                 command.kill('SIGKILL');
