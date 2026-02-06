@@ -47,7 +47,7 @@ jobs:
       # 6. 安装 Playwright 所需的浏览器内核及系统依赖 (无头 Chrome)
        - name: Install Playwright Browsers
          run: |
-           npx playwright install chromium --with-deps
+          npx playwright install chromium --with-deps
 
       # 7. 启动隧道
       - name: Start Tunnel
