@@ -18,7 +18,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20' # 你可以根据需要更改版本
+          node-version: '24' # 你可以根据需要更改版本
 
       # 3. 安装 FFmpeg
       #- name: Install FFmpeg
