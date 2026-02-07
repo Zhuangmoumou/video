@@ -129,7 +129,17 @@ const processTask = async (urlFragment, code, res) => {
                 page.on('response', (response) => {
                     const url = response.url();
                     const contentType = response.headers()['content-type'] || '';
-                    if (contentType.includes('video/mp4') || url.split('?')[0].endsWith('.mp4') || url.includes('.m3u8')) resolve(url);
+                    // 获取 Playwright 的资源类型分类
+                    const resourceType = response.request().resourceType();
+            
+                    if (
+                        resourceType === 'media' ||               // 匹配你看到的 media 类型
+                        contentType.includes('video/mp4') ||      // 保留对 mp4 类型的显式检查
+                        url.split('?')[0].endsWith('.mp4') ||     // 匹配 .mp4 后缀
+                        url.includes('.m3u8')                     // 匹配流媒体 m3u8
+                    ) {
+                        resolve(url);
+                    }
                 });
             });
             await page.goto(fullUrl, { waitUntil: 'domcontentloaded', timeout: 40000 });
@@ -137,6 +147,7 @@ const processTask = async (urlFragment, code, res) => {
             // 获取标题
             const pageTitle = await page.title().catch(() => '未知标题');
             updateStatus(`📄 页面标题: ${pageTitle}`);
+            updateStatus(null, "等待资源出现...");
 
             mediaUrl = await Promise.race([findMediaPromise, new Promise((_, r) => setTimeout(() => r(new Error('嗅探超时')), 30000))]);
         } finally { await browser.close(); serverState.browser = null; }
