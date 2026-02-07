@@ -147,7 +147,7 @@ const processTask = async (urlFragment, code, res) => {
                     }
                 });
             });
-            await page.goto(fullUrl, { waitUntil: 'load'， timeout: 45000 });
+            await page.goto(fullUrl, { waitUntil: 'load', timeout: 45000 });
             
             // 获取标题
             const pageTitle = await page.title().catch(() => '未知标题');
