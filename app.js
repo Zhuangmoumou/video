@@ -43,6 +43,12 @@ const addToBuffer = (type, args) => {
 console.log = (...args) => { addToBuffer('INFO', args); process.stdout.write(args.join(' ') + '\n'); };
 console.error = (...args) => { addToBuffer('ERROR', args); process.stderr.write(args.join(' ') + '\n'); };
 
+// === 中间件配置 ===
+app.use(express.json());
+app.use(express.text({ type: '*/*' })); // 允许解析所有类型的文本输入
+app.use(express.urlencoded({ extended: true }));
+app.use('/dl', express.static(OUT_DIR));
+
 // === 全局状态 ===
 let serverState = {
     isBusy: false,
@@ -55,7 +61,7 @@ let serverState = {
     res: null
 };
 
-// === 辅助函数：清理资源锁 (不删文件) ===
+// === 辅助函数 ===
 const killAndReset = async () => {
     console.log('[System] 🗑 正在释放资源锁...');
     if (serverState.browser) { try { await serverState.browser.close(); } catch (e) {} }
@@ -75,7 +81,6 @@ const killAndReset = async () => {
     serverState.res = null;
 };
 
-// === 辅助函数：物理删除文件 ===
 const forceCleanFiles = async () => {
     const deletedFiles = [];
     try {
@@ -114,13 +119,12 @@ const processTask = async (urlFragment, code, res) => {
     try {
         serverState.currentTask = '浏览器解析';
         updateStatus(`🚀 任务开始 (${code})`);
-        updateStatus(null, "🌏 正在打开浏览器");
         const browser = await chromium.launch({ headless: true });
         serverState.browser = browser;
         let mediaUrl = null;
         try {
             const page = await browser.newPage();
-            updateStatus(`🌐 打开页面: ${fullUrl}`);
+            updateStatus(`🌐 正在打开页面: ${fullUrl}`);
             const findMediaPromise = new Promise((resolve) => {
                 page.on('response', (response) => {
                     const url = response.url();
@@ -129,8 +133,11 @@ const processTask = async (urlFragment, code, res) => {
                 });
             });
             await page.goto(fullUrl, { waitUntil: 'domcontentloaded', timeout: 40000 });
+            
+            // 获取标题
             const pageTitle = await page.title().catch(() => '未知标题');
-            updateStatus(`📄 页面标题: ${pageTitle}`); 
+            updateStatus(`📄 页面标题: ${pageTitle}`);
+
             mediaUrl = await Promise.race([findMediaPromise, new Promise((_, r) => setTimeout(() => r(new Error('嗅探超时')), 30000))]);
         } finally { await browser.close(); serverState.browser = null; }
 
@@ -151,7 +158,6 @@ const processTask = async (urlFragment, code, res) => {
                 curr += c.length;
                 const p = total ? Math.floor((curr / total) * 100) : 0;
                 const now = Date.now();
-                // MP4 下载进度节流：百分比增加 且 间隔 > 500ms
                 if (p > lastP && (now - lastT > 500)) {
                     lastP = p; lastT = now;
                     updateStatus(null, `📥 下载: ${p}% (${(curr/1024/1024).toFixed(2)}MB)`);
@@ -169,7 +175,7 @@ const processTask = async (urlFragment, code, res) => {
             cmd.on('progress', (p) => updateStatus(null, `📦 压缩: ${Math.floor(p.percent || 0)}%`));
             cmd.on('end', resolve); cmd.on('error', reject);
         });
-        updateStuatus("✅ 所有任务完成\n\n");
+
         if (!res.writableEnded) res.write(JSON.stringify({ "url": `https://${res.req.headers.host}/dl/${fileName}` }) + '\n');
     } catch (error) {
         if (res && !res.writableEnded) res.write(JSON.stringify({ "error": error.message }) + '\n');
@@ -177,14 +183,17 @@ const processTask = async (urlFragment, code, res) => {
 };
 
 // === 路由入口 ===
-app.use(express.json());
-app.use('/dl', express.static(OUT_DIR));
-
 app.post('/', async (req, res) => {
-    const body = req.body;
+    // 1. 安全获取 body，防止 undefined 导致崩溃
+    const body = req.body || {};
+    
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
     res.setHeader('Transfer-Encoding', 'chunked');
 
+    // 2. 统一判断逻辑 (兼容字符串和对象)
+    const isStr = typeof body === 'string';
+    
+    // 日志查询
     if (body === 'log' || body.log) {
         const logContent = [`=== 系统状态 ===`, `时间: ${new Date().toLocaleString()}`, `状态: ${serverState.isBusy ? '忙碌' : '空闲'}`, `\n=== 最近日志 ===`, ...logBuffer].join('\n');
         await fs.writeFile(path.join(OUT_DIR, 'log.txt'), logContent);
@@ -192,12 +201,14 @@ app.post('/', async (req, res) => {
         res.end(); return;
     }
 
+    // 列表查询
     if (body === 'ls' || body.ls) {
         const files = await fs.readdir(OUT_DIR);
         res.write(JSON.stringify({ "ls": files }) + '\n');
         res.end(); return;
     }
 
+    // 停止或清理
     if (body === 'rm' || body.rm || body === 'stop') {
         const info = serverState.isBusy ? { code: serverState.currentCode, task: serverState.currentTask } : "无任务";
         await killAndReset();
@@ -210,14 +221,17 @@ app.post('/', async (req, res) => {
         res.end(); return;
     }
 
+    // 中止指定任务
     if (body.del) {
-        if (serverState.isBusy && serverState.currentCode === Number(body.del)) {
+        const delCode = Number(body.del);
+        if (serverState.isBusy && serverState.currentCode === delCode) {
             await killAndReset();
-            res.write(JSON.stringify({ success: `任务 ${body.del} 已中止` }) + '\n');
+            res.write(JSON.stringify({ success: `任务 ${delCode} 已中止` }) + '\n');
         } else { res.write(JSON.stringify({ error: "任务未运行" }) + '\n'); }
         res.end(); return;
     }
 
+    // 新建任务
     if (body.url && body.code) {
         if (serverState.isBusy) {
             res.write(JSON.stringify({ "error": `忙碌中: ${serverState.currentCode}` }) + '\n');
@@ -228,7 +242,9 @@ app.post('/', async (req, res) => {
         processTask(body.url, serverState.currentCode, res);
         return;
     }
-    res.end(JSON.stringify({ "error": "无效请求" }));
+
+    res.write(JSON.stringify({ "error": "无效请求参数" }) + '\n');
+    res.end();
 });
 
 app.listen(PORT, () => console.log(`=== Server Started on ${PORT} ===`));
