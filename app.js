@@ -122,16 +122,20 @@ const processTask = async (urlFragment, code, res) => {
         updateStatus(null, "🌏 等待浏览器启动");
         const browser = await chromium.launch({ headless: true });
         serverState.browser = browser;
+        const context = await browser.newContext({
+            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36'
+        });
         let mediaUrl = null;
         try {
-            const page = await browser.newPage();
-            updateStatus(`🌐 正在打开页面: ${fullUrl}`);
+            const page = await context.newPage();
+            updateStatus(`🌐 打开页面: ${fullUrl}`);
             const findMediaPromise = new Promise((resolve) => {
                 page.on('response', (response) => {
                     const url = response.url();
                     const contentType = response.headers()['content-type'] || '';
                     // 获取 Playwright 的资源类型分类
                     const resourceType = response.request().resourceType();
+                    // 调试 console.log(`[Debug] 资源: ${url.substring(0, 60)}... 类型: ${resourceType}`);
             
                     if (
                         resourceType === 'media' ||               // 匹配你看到的 media 类型
@@ -143,14 +147,17 @@ const processTask = async (urlFragment, code, res) => {
                     }
                 });
             });
-            await page.goto(fullUrl, { timeout: 30000 });
+            await page.goto(fullUrl, { waitUntil: 'load'， timeout: 45000 });
             
             // 获取标题
             const pageTitle = await page.title().catch(() => '未知标题');
             updateStatus(`📄 页面标题: ${pageTitle}`);
             updateStatus(null, "等待资源出现...");
 
-            mediaUrl = await Promise.race([findMediaPromise, new Promise((_, r) => setTimeout(() => r(new Error('嗅探超时')), 30000))]);
+            mediaUrl = await Promise.race([
+                findMediaPromise, 
+                new Promise((_, r) => setTimeout(() => r(new Error('嗅探超时')), 30000))
+            ]);
         } finally { await browser.close(); serverState.browser = null; }
 
         const isM3U8 = mediaUrl.includes('.m3u8');
@@ -228,7 +235,7 @@ app.post('/', async (req, res) => {
             const deleted = await forceCleanFiles();
             res.write(JSON.stringify({ "stop": info, "del": deleted }) + '\n');
         } else {
-            res.write(JSON.stringify({ "stop": info, "note": "文件已保留" }) + '\n');
+            res.write(JSON.stringify({ "stop": info }) + '\n');
         }
         res.end(); return;
     }
@@ -239,7 +246,11 @@ app.post('/', async (req, res) => {
         if (serverState.isBusy && serverState.currentCode === delCode) {
             await killAndReset();
             res.write(JSON.stringify({ success: `任务 ${delCode} 已中止` }) + '\n');
-        } else { res.write(JSON.stringify({ error: "任务未运行" }) + '\n'); }
+        } else if (serverState.isBusy && serverState.currentCode != delCode) {
+            res.write(JSON.stringify({ error: `这不是你的任务：${serverState.currentCode}，无法终止\n\n进度：${serverState.currentTask}\n\n${serverState.progressStr}` }) + '\n');
+        } else {
+            res.write(JSON.stringify({ error: "无任务运行" }) + '\n');
+        }
         res.end(); return;
     }
 
@@ -259,4 +270,4 @@ app.post('/', async (req, res) => {
     res.end();
 });
 
-app.listen(PORT, () => console.log(`=== Server Started on ${PORT} ===`));
+app.listen(PORT, () => console.log(`=== 视频服务器启动于 ${PORT} ===`));
