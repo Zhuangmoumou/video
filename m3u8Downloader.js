@@ -69,7 +69,9 @@ async function downloadM3U8(m3u8Url, outputPath, onProgress, serverState) {
                 if (percent > lastPercent && (now - lastUpdateTime > 500)) {
                     lastPercent = percent;
                     lastUpdateTime = now;
-                    onProgress(percent, (totalBytes / 1024 / 1024).toFixed(2) + "MB");
+                    const currMB = (totalBytes / 1024 / 1024).toFixed(2);
+                    const segProgress = `${downloadedCount}/${totalSegments}`; // 分片进度
+                    onProgress(percent, `${currMB}MB`, segProgress); 
                 }
             }));
         }

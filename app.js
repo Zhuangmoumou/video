@@ -166,22 +166,37 @@ const processTask = async (urlFragment, code, res) => {
 
         if (isM3U8) {
             updateStatus(`📦 M3U8 模式...`);
-            await downloadM3U8(mediaUrl, downloadPath, (p, s) => updateStatus(null, `📥 下载: ${p}% (${s})`), serverState);
+            await downloadM3U8(mediaUrl, downloadPath, (p, s, seg) => {
+                updateStatus(null, `📥 下载: ${p}% (${s}) [分片:${seg}]`);
+            }, serverState);
         } else {
             const writer = fs.createWriteStream(downloadPath);
             const response = await axios({ url: mediaUrl, responseType: 'stream', signal: serverState.abortController.signal });
+            
+            // 1. 获取总字节数并转换为 MB
             const total = parseInt(response.headers['content-length'] || '0', 10);
+            const totalMB = (total / 1024 / 1024).toFixed(2); 
+            
             let curr = 0, lastP = -1, lastT = 0;
-
+            
             response.data.on('data', (c) => {
                 curr += c.length;
                 const p = total ? Math.floor((curr / total) * 100) : 0;
                 const now = Date.now();
+                
+                // 进度控制: 只有百分比变化且间隔超过 500ms 才更新，防止日志刷屏
                 if (p > lastP && (now - lastT > 500)) {
-                    lastP = p; lastT = now;
-                    updateStatus(null, `📥 下载: ${p}% (${(curr/1024/1024).toFixed(2)}MB)`);
+                    lastP = p; 
+                    lastT = now;
+                    
+                    // 2. 计算当前已下载的 MB
+                    const currMB = (curr / 1024 / 1024).toFixed(2);
+                    
+                    // 3. 修改输出格式为：已下载/总大小
+                    updateStatus(null, `📥 下载: ${p}% (${currMB}/${totalMB}MB)`);
                 }
             });
+            
             response.data.pipe(writer);
             await new Promise((resolve, reject) => { writer.on('finish', resolve); writer.on('error', reject); });
         }
@@ -191,7 +206,10 @@ const processTask = async (urlFragment, code, res) => {
         await new Promise((resolve, reject) => {
             const cmd = ffmpeg(downloadPath).outputOptions(['-vf', 'scale=320:170:force_original_aspect_ratio=decrease,pad=320:170:(ow-iw)/2:(oh-ih)/2','-c:v', 'libx264', '-crf', '18', '-preset', 'slow', '-c:a', 'copy']).save(outPath);
             serverState.ffmpegCommand = cmd;
-            cmd.on('progress', (p) => updateStatus(null, `📦 压缩: ${Math.floor(p.percent || 0)}%`));
+            cmd.on('progress', (p) => {
+                const outMB = (p.targetSize / 1024).toFixed(2); // 已输出的大小
+                updateStatus(null, `📦 压缩: ${Math.floor(p.percent || 0)}% (${outMB}MB)`);
+            });
             cmd.on('end', resolve); cmd.on('error', reject);
         });
         updateStatus("✅ 任务完成\n\n");
