@@ -215,7 +215,7 @@ const processTask = async (urlFragment, code, res) => {
         updateStatus("✅ 任务完成\n\n");
         if (!res.writableEnded) res.write(JSON.stringify({ "url": `https://${res.req.headers.host}/dl/${fileName}` }) + '\n');
     } catch (error) {
-        if (res && !res.writableEnded) res.write(JSON.stringify({ "error": error.message }) + '\n');
+        if (res && !res.writableEnded) res.write(JSON.stringify({ "error": error.toString() }) + '\n');
         console.error('[Task Error]', error); 
     } finally { await killAndReset(); }
 };
