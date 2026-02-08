@@ -63,10 +63,10 @@ async function downloadM3U8(m3u8Url, outputPath, onProgress, serverState) {
                 downloadedCount++;
                 ffmpegList[realIndex] = `file '${tsFileName}'`;
 
-                // 进度控制: 1% 精度, 500ms 频率
+                // 进度控制: 1% 精度, 300ms 频率
                 const percent = Math.floor((downloadedCount / totalSegments) * 100);
                 const now = Date.now();
-                if (percent > lastPercent && (now - lastUpdateTime > 500)) {
+                if (percent > lastPercent && (now - lastUpdateTime > 300)) {
                     lastPercent = percent;
                     lastUpdateTime = now;
                     const currMB = (totalBytes / 1024 / 1024).toFixed(2);

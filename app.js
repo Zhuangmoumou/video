@@ -200,8 +200,8 @@ const processTask = async (urlFragment, code, res) => {
                 const p = total ? Math.floor((curr / total) * 100) : 0;
                 const now = Date.now();
                 
-                // 进度控制: 只有百分比变化且间隔超过 500ms 才更新，防止日志刷屏
-                if (p > lastP && (now - lastT > 500)) {
+                // 进度控制: 只有百分比变化且间隔超过 300ms 才更新，防止日志刷屏
+                if (p > lastP && (now - lastT > 300)) {
                     lastP = p; 
                     lastT = now;
                     
