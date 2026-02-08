@@ -100,8 +100,24 @@ const forceCleanFiles = async () => {
 
 // === 核心处理逻辑 ===
 const processTask = async (urlFragment, code, res) => {
-    const fullUrl = `https://www.mgnacg.com/bangumi/${urlFragment}`;
-    const fileName = `${urlFragment}.mp4`;
+    let fullUrl;
+    if (urlFragment.startsWith('http')) {
+        fullUrl = urlFragment;
+    } else {
+        fullUrl = `https://www.mgnacg.com/bangumi/${urlFragment}`;
+    }
+
+    // 2. 安全生成文件名：
+    // 如果是 URL，提取最后一段或使用 code 命名，防止非法字符导致保存失败
+    let fileName;
+    if (urlFragment.startsWith('http')) {
+        // 提取 URL 中最后一段作为文件名，并过滤掉非法字符
+        const urlObj = new URL(fullUrl);
+        const pathName = urlObj.pathname.split('/').pop() || 'video';
+        fileName = `${code}_${pathName.replace(/[^a-z0-9]/gi, '_')}.mp4`;
+    } else {
+        fileName = `${urlFragment}.mp4`;
+    }
     const downloadPath = path.join(ROOT_DIR, fileName);
     const outPath = path.join(OUT_DIR, fileName);
     serverState.res = res; 
