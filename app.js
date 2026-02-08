@@ -136,7 +136,7 @@ const processTask = async (urlFragment, code, res) => {
         serverState.currentTask = '浏览器解析';
         updateStatus(`🚀 任务开始 (${code})`);
         updateStatus(null, "🌏 等待浏览器启动");
-        const browser = await chromium.launch({ headless: true });
+        const browser = await chromium.launch({ headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
         serverState.browser = browser;
         const context = await browser.newContext({
             userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36'
@@ -144,7 +144,7 @@ const processTask = async (urlFragment, code, res) => {
         let mediaUrl = null;
         try {
             const page = await context.newPage();
-            updateStatus(`🌐 打开页面: ${fullUrl}`);
+            updateStatus(`🔗 打开页面: ${fullUrl}`);
             const findMediaPromise = new Promise((resolve) => {
                 page.on('response', (response) => {
                     const url = response.url();
