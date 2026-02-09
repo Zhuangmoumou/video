@@ -154,10 +154,7 @@ const processTask = async (urlFragment, code, res) => {
                     // 调试 console.log(`[Debug] 资源: ${url.substring(0, 60)}... 类型: ${resourceType}`);
             
                     if (
-                        resourceType === 'media' ||               // 匹配你看到的 media 类型
-                        contentType.includes('video/mp4') ||      // 保留对 mp4 类型的显式检查
-                        url.split('?')[0].endsWith('.mp4') ||     // 匹配 .mp4 后缀
-                        url.includes('.m3u8')                     // 匹配流媒体 m3u8
+                        resourceType === 'media' || contentType.includes('video/mp4') || url.split('?')[0].endsWith('.mp4') || url.includes('.m3u8') || contentType.includes('media')
                     ) {
                         resolve(url);
                     }
