@@ -235,7 +235,12 @@ const processTask = async (urlFragment, code, res) => {
                 ]);
             }
         } finally { await browser.close(); serverState.browser = null; }
-
+        // 构造axios的请求头
+        const headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Referer': fullUrl, 
+            'Origin': new URL(fullUrl).origin
+        };
         const isM3U8 = mediaUrl.includes('.m3u8');
         serverState.currentTask = isM3U8 ? 'M3U8下载' : 'MP4下载';
         serverState.abortController = new AbortController();
@@ -247,7 +252,7 @@ const processTask = async (urlFragment, code, res) => {
             }, serverState);
         } else {
             const writer = fs.createWriteStream(downloadPath);
-            const response = await axios({ url: mediaUrl, responseType: 'stream', signal: serverState.abortController.signal });
+            const response = await axios({ url: mediaUrl, responseType: 'stream', signal: serverState.abortController.signal, headers: headers });
             
             // 1. 获取总字节数并转换为 MB
             const total = parseInt(response.headers['content-length'] || '0', 10);
