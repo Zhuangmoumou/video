@@ -136,10 +136,48 @@ const processTask = async (urlFragment, code, res) => {
         serverState.currentTask = '浏览器解析';
         updateStatus(`🚀 任务开始 (${code})`);
         updateStatus(null, "🌏 等待浏览器启动");
-        const browser = await chromium.launch({ headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+        const browser = await chromium.launch({ headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-blink-features=AutomationControlled', '--disable-infobars'] });
         serverState.browser = browser;
         const context = await browser.newContext({
             userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36'
+        });
+        await context.addInitScript(() => {
+            // 1. 屏蔽 Function 构造器中的 debugger
+            const ArrayMethod = ["constructor", "toString"];
+            const check = function () {
+                return false;
+            };
+            
+            // 劫持 Function 构造函数
+            const oldFunctionConstructor = window.Function.prototype.constructor;
+            window.Function.prototype.constructor = function (str) {
+                if (str && str.indexOf('debugger') !== -1) {
+                    // 如果包含 debugger，返回一个空函数
+                    return function () {};
+                }
+                return oldFunctionConstructor.apply(this, arguments);
+            };
+        
+            // 2. 屏蔽 eval 中的 debugger
+            const oldEval = window.eval;
+            window.eval = function (str) {
+                if (str && str.indexOf('debugger') !== -1) {
+                    return str.replace(/debugger/g, '');
+                }
+                return oldEval(str);
+            };
+        
+            // 3. 针对某些网站通过 setInterval 运行 debugger 的情况
+            const oldSetInterval = window.setInterval;
+            window.setInterval = function (handler, timeout, ...args) {
+                if (handler && handler.toString().indexOf('debugger') !== -1) {
+                    return null;
+                }
+                return oldSetInterval(handler, timeout, ...args);
+            };
+        
+            // 4. 伪装 Webdriver
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
         });
         let mediaUrl = null;
         try {
@@ -156,6 +194,7 @@ const processTask = async (urlFragment, code, res) => {
                     if (
                         resourceType === 'media' || contentType.includes('video/mp4') || url.split('?')[0].endsWith('.mp4') || url.includes('.m3u8') || contentType.includes('media')
                     ) {
+                        updateStatus(`🎯 命中目标: ${url.substring(0, 50)}...`);
                         resolve(url);
                     }
                 });
