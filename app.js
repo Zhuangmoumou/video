@@ -204,12 +204,36 @@ const processTask = async (urlFragment, code, res) => {
             // 获取标题
             const pageTitle = await page.title().catch(() => '未知标题');
             updateStatus(`📄 页面标题: ${pageTitle}`);
-            updateStatus(null, "等待资源出现...");
-
-            mediaUrl = await Promise.race([
-                findMediaPromise, 
-                new Promise((_, r) => setTimeout(() => r(new Error('嗅探超时')), 30000))
-            ]);
+            updateStatus(null, "尝试直接获取视频URL...");
+            const directUrl = await page.evaluate(() => {
+                // 尝试访问全局对象 player_aaaa
+                if (typeof window.player_aaaa !== 'undefined' && window.player_aaaa !== null) {
+                    const url = window.player_aaaa.url;
+                    // 检查 url 是否存在且以 http 开头
+                    if (typeof url === 'string' && url.startsWith('http')) {
+                        return url;
+                    }
+                }
+                return null; // 如果没有找到或不符合要求，返回 null
+            }).catch(e => {
+                console.error('[Playwright Eval Error]', e);
+                return null; // 评估失败也返回 null
+            });
+    
+            if (directUrl) {
+                mediaUrl = directUrl;
+                updateStatus(`⚡️ 成功通过 player_aaaa.url 获取到媒体URL!`);
+                updateStatus(`🎯 目标URL: ${mediaUrl.substring(0, 50)}...`);
+                // 此时 mediaUrl 已确定，跳过嗅探逻辑
+            } else {
+                updateStatus("🔍 未找到 player_aaaa.url 或 URL无效，回退到监听抓取...");
+                updateStatus(null, "等待资源出现...");
+    
+                mediaUrl = await Promise.race([
+                    findMediaPromise, 
+                    new Promise((_, r) => setTimeout(() => r(new Error('嗅探超时')), 30000))
+                ]);
+            }
         } finally { await browser.close(); serverState.browser = null; }
 
         const isM3U8 = mediaUrl.includes('.m3u8');
