@@ -183,17 +183,19 @@ const processTask = async (urlFragment, code, res) => {
         try {
             const page = await context.newPage();
             updateStatus(`🔗 打开页面: ${fullUrl}`);
+            let found = false;
             const findMediaPromise = new Promise((resolve) => {
                 page.on('response', (response) => {
+                    if (found) return;
                     const url = response.url();
                     const contentType = response.headers()['content-type'] || '';
                     // 获取 Playwright 的资源类型分类
                     const resourceType = response.request().resourceType();
                     // 调试 console.log(`[Debug] 资源: ${url.substring(0, 60)}... 类型: ${resourceType}`);
-            
                     if (
                         resourceType === 'media' || contentType.includes('video/mp4') || url.split('?')[0].endsWith('.mp4') || url.includes('.m3u8') || contentType.includes('media')
                     ) {
+                        found = true;
                         updateStatus(`🎯 命中目标: ${url.substring(0, 50)}...`);
                         resolve(url);
                     }
