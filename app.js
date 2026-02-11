@@ -188,6 +188,12 @@ const processTask = async (urlFragment, file = null, code, res) => {
         try {
             const page = await context.newPage();
             updateStatus(`🔗 打开页面: ${fullUrl}`);
+            await page.goto(fullUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
+            
+            // 获取标题
+            const pageTitle = await page.title().catch(() => '未知标题');
+            updateStatus(`📄 页面标题: ${pageTitle}`);
+            updateStatus(null, "等待资源出现...");
             const findMediaPromise = new Promise((resolve) => {
                 page.on('response', (response) => {
                     if (found) return
@@ -204,12 +210,6 @@ const processTask = async (urlFragment, file = null, code, res) => {
                     }
                 });
             });
-            await page.goto(fullUrl, { waitUntil: 'load', timeout: 45000 });
-            
-            // 获取标题
-            const pageTitle = await page.title().catch(() => '未知标题');
-            updateStatus(`📄 页面标题: ${pageTitle}`);
-            updateStatus(null, "等待资源出现...");
             mediaUrl = await Promise.race([
                 findMediaPromise, 
                 new Promise((_, r) => setTimeout(() => r(new Error('嗅探超时')), 30000))
