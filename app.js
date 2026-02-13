@@ -10,7 +10,7 @@ const { downloadM3U8 } = require('./m3u8Downloader');
 const app = express();
 const PORT = 9898;
 
-const ROOT_DIR = path.join('/root/', 'mp4');
+const ROOT_DIR = path.join(process.cwd(), 'mp4');
 const OUT_DIR = path.join(ROOT_DIR, 'out');
 fs.ensureDirSync(ROOT_DIR);
 fs.ensureDirSync(OUT_DIR);
