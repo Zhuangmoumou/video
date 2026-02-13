@@ -10,7 +10,7 @@ const { downloadM3U8 } = require('./m3u8Downloader');
 const app = express();
 const PORT = 9898;
 
-const ROOT_DIR = path.join(process.cwd(), 'mp4');
+const ROOT_DIR = path.join('/root/', 'mp4');
 const OUT_DIR = path.join(ROOT_DIR, 'out');
 fs.ensureDirSync(ROOT_DIR);
 fs.ensureDirSync(OUT_DIR);
@@ -263,7 +263,7 @@ const processTask = async (urlFragment, file = null, code, res) => {
         serverState.currentTask = 'FFmpeg压缩';
         updateStatus(null, `📦 压缩中...`);
         await new Promise((resolve, reject) => {
-            const cmd = ffmpeg(downloadPath).outputOptions(['-vf', 'scale=320:170:force_original_aspect_ratio=decrease,pad=320:170:(ow-iw)/2:(oh-ih)/2','-c:v', 'libx264', '-crf', '18', '-preset', 'slow', '-c:a', 'copy']).save(outPath);
+            const cmd = ffmpeg(downloadPath).outputOptions(['-vf', 'scale=320:170:force_original_aspect_ratio=decrease,pad=320:170:(ow-iw)/2:(oh-ih)/2','-c:v', 'libx264', '-crf', '17', '-preset', 'medium', '-c:a', 'copy']).save(outPath);
             serverState.ffmpegCommand = cmd;
             cmd.on('progress', (p) => {
                 const outMB = (p.targetSize / 1024).toFixed(2); // 已输出的大小
