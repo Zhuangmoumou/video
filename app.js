@@ -48,6 +48,21 @@ app.use(express.json());
 app.use(express.text({ type: '*/*' })); // 允许解析所有类型的文本输入
 app.use(express.urlencoded({ extended: true }));
 app.use('/dl', express.static(OUT_DIR));
+// GET /log路径，可以直接获取日志
+app.get('/log', (req, res) => {
+    const logContent = [
+        `=== 系统状态 ===`,
+        `时间: ${new Date().toLocaleString()}`,
+        `状态: ${serverState.isBusy ? '忙碌' : '空闲'}`,
+        `任务: ${serverState.currentTask || '无'}`,
+        `进度: ${serverState.progressStr || '无'}`,
+        `\n=== 最近日志 ===`,
+        ...logBuffer
+    ].join('\n');
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    res.send(logContent);
+});
+
 
 // === 全局状态 ===
 let serverState = {
@@ -132,7 +147,7 @@ const processTask = async (urlFragment, file = null, code, res) => {
         if (dynamicStatus) { serverState.progressStr = dynamicStatus; console.log(`[进程] ${dynamicStatus}`); }
         if (serverState.res && !serverState.res.writableEnded) {
             const fullContent = logHistory.join('\n\n') + (dynamicStatus ? `\n\n ${dynamicStatus}` : '');
-            serverState.res.write(JSON.stringify({ content: fullContent }) + '\n');
+            serverState.res.write(JSON.stringify({ type: "msg", content: fullContent }) + '\n');
         }
     };
 
@@ -272,9 +287,9 @@ const processTask = async (urlFragment, file = null, code, res) => {
             cmd.on('end', resolve); cmd.on('error', reject);
         });
         updateStatus("✅ 任务完成\n\n");
-        if (!res.writableEnded) res.write(JSON.stringify({ "url": `https://${res.req.headers.host}/dl/${fileName}` }) + '\n');
+        if (!res.writableEnded) res.write(JSON.stringify({ "type": "url", "url": `https://${res.req.headers.host}/dl/${fileName}` }) + '\n');
     } catch (error) {
-        if (res && !res.writableEnded) res.write(JSON.stringify({ "error": error.toString() }) + '\n');
+        if (res && !res.writableEnded) res.write(JSON.stringify({ "type": "error", "error": error.toString() }) + '\n');
         console.error('[Task Error]', error); 
     } finally { await killAndReset(); }
 };
@@ -294,14 +309,14 @@ app.post('/', async (req, res) => {
     if (body === 'log' || body.log) {
         const logContent = [`=== 系统状态 ===`, `时间: ${new Date().toLocaleString()}`, `状态: ${serverState.isBusy ? '忙碌' : '空闲'}`, `\n=== 最近日志 ===`, ...logBuffer].join('\n');
         await fs.writeFile(path.join(OUT_DIR, 'log.txt'), logContent);
-        res.write(JSON.stringify({ "log": `https://${req.headers.host}/dl/log.txt` }) + '\n');
+        res.write(JSON.stringify({ "type": "log", "log": `https://${req.headers.host}/dl/log.txt` }) + '\n');
         res.end(); return;
     }
 
     // 列表查询
     if (body === 'ls' || body.ls) {
         const files = await fs.readdir(OUT_DIR);
-        res.write(JSON.stringify({ "ls": files }) + '\n');
+        res.write(JSON.stringify({ "type": "ls", "ls": files }) + '\n');
         res.end(); return;
     }
 
@@ -311,9 +326,9 @@ app.post('/', async (req, res) => {
         await killAndReset();
         if (body === 'rm' || body.rm) {
             const deleted = await forceCleanFiles();
-            res.write(JSON.stringify({ "stop": info, "del": deleted }) + '\n');
+            res.write(JSON.stringify({ "type": "stop", "stop": info, "del": deleted }) + '\n');
         } else {
-            res.write(JSON.stringify({ "stop": info }) + '\n');
+            res.write(JSON.stringify({ "type": "stop", "stop": info }) + '\n');
         }
         res.end(); return;
     }
@@ -323,11 +338,11 @@ app.post('/', async (req, res) => {
         const delCode = Number(body.del);
         if (serverState.isBusy && serverState.currentCode === delCode) {
             await killAndReset();
-            res.write(JSON.stringify({ success: `任务 ${delCode} 已中止` }) + '\n');
+            res.write(JSON.stringify({ type: "msg", content: `任务 ${delCode} 已中止` }) + '\n');
         } else if (serverState.isBusy && serverState.currentCode != delCode) {
-            res.write(JSON.stringify({ error: `这不是你的任务：${serverState.currentCode}，无法终止\n\n进度：${serverState.currentTask}\n\n${serverState.progressStr}` }) + '\n');
+            res.write(JSON.stringify({ type: "error", error: `这不是你的任务：${serverState.currentCode}，无法终止\n\n进度：${serverState.currentTask}\n\n${serverState.progressStr}` }) + '\n');
         } else {
-            res.write(JSON.stringify({ error: "无任务运行" }) + '\n');
+            res.write(JSON.stringify({ "type": "error",  error: "无任务运行" }) + '\n');
         }
         res.end(); return;
     }
@@ -335,7 +350,7 @@ app.post('/', async (req, res) => {
     // 新建任务
     if (body.url && body.code) {
         if (serverState.isBusy) {
-            res.write(JSON.stringify({ "error": `忙碌中: ${serverState.currentCode}` }) + '\n');
+            res.write(JSON.stringify({ "type": "error", "error": `忙碌中: ${serverState.currentCode}` }) + '\n');
             res.end(); return;
         }
         serverState.isBusy = true;
@@ -344,7 +359,7 @@ app.post('/', async (req, res) => {
         return;
     }
 
-    res.write(JSON.stringify({ "error": "无效请求参数" }) + '\n');
+    res.write(JSON.stringify({ "type": "error", "error": "无效请求参数" }) + '\n');
     res.end();
 });
 
