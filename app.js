@@ -175,7 +175,8 @@ const processTask = async (urlFragment, file = null, code, res) => {
             updateStatus('⚡ 尝试直接解析HTML以快速获取链接...');
             try {
                 const htmlContent = await page.content();
-                const match = htmlContent.match(/var player_aaaa\s*=\s*({.*?});/);
+                const regex = new RegExp("var player_aaaa\\s*=\\s*({.*?});?");
+                const match = htmlContent.match(regex);
                 if (match && match[1]) {
                     const playerData = eval('(' + match[1] + ')');
                     const url = playerData.url;
