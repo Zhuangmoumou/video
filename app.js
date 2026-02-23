@@ -157,81 +157,76 @@ const processTask = async (urlFragment, file = null, code, res) => {
         updateStatus(null, "🌏 等待浏览器启动");
         const browser = await chromium.launch({ headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-blink-features=AutomationControlled', '--disable-infobars'] });
         serverState.browser = browser;
-        const context = await browser.newContext({
-            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36'
-        });
-        // await context.addInitScript(() => {
-            // // 1. 屏蔽 Function 构造器中的 debugger
-            // const ArrayMethod = ["constructor", "toString"];
-            // const check = function () {
-                // return false;
-            // };
-            
-            // // 劫持 Function 构造函数
-            // const oldFunctionConstructor = window.Function.prototype.constructor;
-            // window.Function.prototype.constructor = function (str) {
-                // if (str && str.indexOf('debugger') !== -1) {
-                    // // 如果包含 debugger，返回一个空函数
-                    // return function () {};
-                // }
-                // return oldFunctionConstructor.apply(this, arguments);
-            // };
         
-            // // 2. 屏蔽 eval 中的 debugger
-            // const oldEval = window.eval;
-            // window.eval = function (str) {
-                // if (str && str.indexOf('debugger') !== -1) {
-                    // return str.replace(/debugger/g, '');
-                // }
-                // return oldEval(str);
-            // };
-        
-            // // 3. 针对某些网站通过 setInterval 运行 debugger 的情况
-            // const oldSetInterval = window.setInterval;
-            // window.setInterval = function (handler, timeout, ...args) {
-                // if (handler && handler.toString().indexOf('debugger') !== -1) {
-                    // return null;
-                // }
-                // return oldSetInterval(handler, timeout, ...args);
-            // };
-        
-            // // 4. 伪装 Webdriver
-            // Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-        // });
         let mediaUrl = null;
-        let found = false;
+
         try {
+            const context = await browser.newContext({
+                userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36'
+            });
             const page = await context.newPage();
             updateStatus(`🔗 打开页面: ${fullUrl}`);
             await page.goto(fullUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
             
-            // 获取标题
             const pageTitle = await page.title().catch(() => '未知标题');
             updateStatus(`📄 页面标题: ${pageTitle}`);
-            updateStatus(null, "等待资源出现...");
-            const findMediaPromise = new Promise((resolve) => {
-                page.on('response', (response) => {
-                    if (found) return
-                    const url = response.url();
-                    const contentType = response.headers()['content-type'] || '';
-                    // 获取 Playwright 的资源类型分类
-                    const resourceType = response.request().resourceType();
-                    // 调试 console.log(`[Debug] 资源: ${url.substring(0, 60)}... 类型: ${resourceType}`);
-                    const mediaResource = resourceType === 'media' || url.split('?')[0].endsWith('.m3u8') || contentType.includes('video/mp4') || contentType.includes('media') || url.split('?')[0].endsWith('.mp4');
-                    if (mediaResource) {
-                        //page.off('response', responseHandler);
-                        found = true;
-                        updateStatus(`🎯 命中目标: ${url.substring(0, 50)}...`);
-                        resolve(url);
+
+            // === 新增：直接解析HTML逻辑开始 ===
+            updateStatus('⚡ 尝试直接解析HTML以快速获取链接...');
+            try {
+                const htmlContent = await page.content();
+                const match = htmlContent.match(/var player_aaaa\s*=\s*({.*?});/);
+                if (match && match[1]) {
+                    const playerData = JSON.parse(match[1]);
+                    const url = playerData.url;
+                    if (url && url.startsWith('http') && (url.endsWith('.m3u8') || url.endsWith('.mp4'))) {
+                        mediaUrl = url;
+                        updateStatus(`🎯 快速命中: ${url.substring(0, 70)}...`);
+                    } else {
+                        updateStatus('🟡 解析成功，但URL格式无效，将回退到网络监听。');
                     }
+                } else {
+                    updateStatus('🟡 页面中未找到player_aaaa对象，将回退到网络监听。');
+                }
+            } catch (e) {
+                updateStatus(`🟡 直接解析时出错: ${e.message}，将回退到网络监听。`);
+            }
+            // === 新增：直接解析HTML逻辑结束 ===
+
+            // === 修改：如果快速解析失败，则回退到网络监听 ===
+            if (!mediaUrl) {
+                updateStatus('📡 启动网络监听以嗅探链接...');
+                updateStatus(null, "等待资源出现...");
+                let found = false;
+                const findMediaPromise = new Promise((resolve) => {
+                    page.on('response', (response) => {
+                        if (found) return;
+                        const url = response.url();
+                        const contentType = response.headers()['content-type'] || '';
+                        const resourceType = response.request().resourceType();
+                        const mediaResource = resourceType === 'media' || url.split('?')[0].endsWith('.m3u8') || contentType.includes('video/mp4') || contentType.includes('media') || url.split('?')[0].endsWith('.mp4');
+                        
+                        if (mediaResource) {
+                            found = true;
+                            updateStatus(`🎯 嗅探命中: ${url.substring(0, 70)}...`);
+                            resolve(url);
+                        }
+                    });
                 });
-            });
-            mediaUrl = await Promise.race([
-                findMediaPromise, 
-                new Promise((_, r) => setTimeout(() => r(new Error('嗅探超时')), 30000))
-            ]);
-        } finally { await browser.close(); serverState.browser = null; }
-        // 构造axios的请求头
+                mediaUrl = await Promise.race([
+                    findMediaPromise, 
+                    new Promise((_, r) => setTimeout(() => r(new Error('嗅探超时')), 30000))
+                ]);
+            }
+        } finally { 
+            if (browser) { await browser.close(); }
+            serverState.browser = null; 
+        }
+
+        if (!mediaUrl) {
+            throw new Error("无法通过任何方式找到有效的视频链接。");
+        }
+        
         const headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         };
@@ -248,7 +243,6 @@ const processTask = async (urlFragment, file = null, code, res) => {
             const writer = fs.createWriteStream(downloadPath);
             const response = await axios({ url: mediaUrl, responseType: 'stream', signal: serverState.abortController.signal, headers: headers });
             
-            // 1. 获取总字节数并转换为 MB
             const total = parseInt(response.headers['content-length'] || '0', 10);
             const totalMB = (total / 1024 / 1024).toFixed(2); 
             
@@ -259,15 +253,10 @@ const processTask = async (urlFragment, file = null, code, res) => {
                 const p = total ? Math.floor((curr / total) * 100) : 0;
                 const now = Date.now();
                 
-                // 进度控制: 只有百分比变化且间隔超过 300ms 才更新，防止日志刷屏
                 if (p > lastP && (now - lastT > 300)) {
                     lastP = p; 
                     lastT = now;
-                    
-                    // 2. 计算当前已下载的 MB
                     const currMB = (curr / 1024 / 1024).toFixed(2);
-                    
-                    // 3. 修改输出格式为：已下载/总大小
                     updateStatus(null, `📥 下载: ${p}% (${currMB}/${totalMB}MB)`);
                 }
             });
@@ -282,7 +271,7 @@ const processTask = async (urlFragment, file = null, code, res) => {
             const cmd = ffmpeg(downloadPath).outputOptions(['-vf', 'scale=320:170:force_original_aspect_ratio=decrease,pad=320:170:(ow-iw)/2:(oh-ih)/2','-c:v', 'libx264', '-crf', '17', '-preset', 'medium', '-c:a', 'copy']).save(outPath);
             serverState.ffmpegCommand = cmd;
             cmd.on('progress', (p) => {
-                const outMB = (p.targetSize / 1024).toFixed(2); // 已输出的大小
+                const outMB = (p.targetSize / 1024).toFixed(2);
                 updateStatus(null, `📦 压缩: ${Math.floor(p.percent || 0)}% (${outMB}MB)`);
             });
             cmd.on('end', resolve); cmd.on('error', reject);
