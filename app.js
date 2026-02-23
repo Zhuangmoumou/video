@@ -171,30 +171,51 @@ const processTask = async (urlFragment, file = null, code, res) => {
             const pageTitle = await page.title().catch(() => '未知标题');
             updateStatus(`📄 页面标题: ${pageTitle}`);
 
-            // === 新增：直接解析HTML逻辑开始 ===
+            // === 最终修复：更精确的正则表达式和详细的错误诊断 ===
             updateStatus('⚡ 尝试直接解析HTML以快速获取链接...');
+            let objectString = null; // 用于存储匹配到的对象字符串，以便调试
             try {
                 const htmlContent = await page.content();
-                const regex = new RegExp("var player_aaaa\\s*=\\s*({.*?});?");
+                // 更精确的正则表达式:
+                // 匹配从 "var player_aaaa = {" 开始，到第一个 "}" 结束，并且后面紧跟着 "</script>"
+                // 这能确保我们不会错误地匹配到页面其他地方的内容
+                const regex = new RegExp("var player_aaaa\\s*=\\s*({[\\s\\S]*?})\\s*<\/script>");
                 const match = htmlContent.match(regex);
+                
                 if (match && match[1]) {
-                    const playerData = eval('(' + match[1] + ')');
+                    objectString = match[1]; // 获取匹配的组
+                    
+                    const playerData = eval('(' + objectString + ')');
                     const url = playerData.url;
+
                     if (url && url.startsWith('http') && (url.endsWith('.m3u8') || url.endsWith('.mp4'))) {
                         mediaUrl = url;
                         updateStatus(`🎯 快速命中: ${url.substring(0, 70)}...`);
                     } else {
-                        updateStatus('❕ 解析成功，但URL格式无效，将回退到网络监听。');
+                        updateStatus('🟡 解析成功，但URL格式无效，将回退到网络监听。');
                     }
                 } else {
-                    updateStatus('❕ 页面中未找到player_aaaa对象，将回退到网络监听。');
+                    updateStatus('🟡 页面中未找到player_aaaa对象，将回退到网络监听。');
                 }
             } catch (e) {
-                updateStatus(`❕ 直接解析时出错: ${e.message}，将回退到网络监听。`);
+                // 提供非常详细的错误诊断信息
+                let errorType = e.name; // e.g., "SyntaxError"
+                let errorMessage = e.message; // e.g., "Unexpected token"
+                
+                let diagnosticMessage = `🟡 直接解析时出错: ${errorType}: ${errorMessage}`;
+                
+                // 如果我们成功提取了字符串但eval失败了，就把这个字符串片段包含在日志里
+                if (objectString) {
+                    diagnosticMessage += `\n\n[调试信息] 解析失败的文本片段(前200字符):\n${objectString.substring(0, 200)}`;
+                } else {
+                    diagnosticMessage += `\n\n[调试信息] 正则表达式未能从HTML中匹配到player_aaaa对象。`;
+                }
+                
+                diagnosticMessage += "\n\n将回退到网络监听。";
+                updateStatus(diagnosticMessage);
             }
-            // === 新增：直接解析HTML逻辑结束 ===
+            // === 修复结束 ===
 
-            // === 修改：如果快速解析失败，则回退到网络监听 ===
             if (!mediaUrl) {
                 updateStatus('📡 启动网络监听以嗅探链接...');
                 updateStatus(null, "等待资源出现...");
