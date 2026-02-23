@@ -55,7 +55,7 @@ jobs:
           API_KEY: ${{ secrets.CF_TOKEN }}
         run: |
           # 以服务挂载后台启动 Cloudflare Tunnel
-          sudo cloudflared service install $CF_TOKEN
+          sudo cloudflared service install $API_KEY
 
       - name: Start App
           # 运行 Node.js 应用
