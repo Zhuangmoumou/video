@@ -217,7 +217,8 @@ const processTask = async (urlFragment, file = null, code, res) => {
                     // 获取 Playwright 的资源类型分类
                     const resourceType = response.request().resourceType();
                     // 调试 console.log(`[Debug] 资源: ${url.substring(0, 60)}... 类型: ${resourceType}`);
-                    if (resourceType === 'media' || contentType.includes('video/mp4') || url.split('?')[0].endsWith('.mp4') || url.includes('.m3u8') || contentType.includes('media')) {
+                    const mediaResource = resourceType === 'media' || (resourceType === 'xhr' && url.split('?')[0].endsWith('.m3u8')) || contentType.includes('video/mp4') || url.split('?')[0].endsWith('.mp4');
+                    if (mediaResource) {
                         //page.off('response', responseHandler);
                         found = true;
                         updateStatus(`🎯 命中目标: ${url.substring(0, 50)}...`);
