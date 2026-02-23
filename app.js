@@ -177,19 +177,19 @@ const processTask = async (urlFragment, file = null, code, res) => {
                 const htmlContent = await page.content();
                 const match = htmlContent.match(/var player_aaaa\s*=\s*({.*?});/);
                 if (match && match[1]) {
-                    const playerData = JSON.parse(match[1]);
+                    const playerData = eval('(' + match[1] + ')');
                     const url = playerData.url;
                     if (url && url.startsWith('http') && (url.endsWith('.m3u8') || url.endsWith('.mp4'))) {
                         mediaUrl = url;
                         updateStatus(`🎯 快速命中: ${url.substring(0, 70)}...`);
                     } else {
-                        updateStatus('🟡 解析成功，但URL格式无效，将回退到网络监听。');
+                        updateStatus('❕ 解析成功，但URL格式无效，将回退到网络监听。');
                     }
                 } else {
-                    updateStatus('🟡 页面中未找到player_aaaa对象，将回退到网络监听。');
+                    updateStatus('❕ 页面中未找到player_aaaa对象，将回退到网络监听。');
                 }
             } catch (e) {
-                updateStatus(`🟡 直接解析时出错: ${e.message}，将回退到网络监听。`);
+                updateStatus(`❕ 直接解析时出错: ${e.message}，将回退到网络监听。`);
             }
             // === 新增：直接解析HTML逻辑结束 ===
 
