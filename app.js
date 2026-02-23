@@ -172,7 +172,7 @@ const processTask = async (urlFragment, file = null, code, res) => {
             updateStatus(`📄 页面标题: ${pageTitle}`);
 
             // === 最终修复：更精确的正则表达式和详细的错误诊断 ===
-            updateStatus('⚡ 尝试直接解析HTML以快速获取链接...');
+            updateStatus('尝试直接解析HTML以快速获取链接...');
             let objectString = null; // 用于存储匹配到的对象字符串，以便调试
             try {
                 const htmlContent = await page.content();
@@ -192,17 +192,17 @@ const processTask = async (urlFragment, file = null, code, res) => {
                         mediaUrl = url;
                         updateStatus(`🎯 快速命中: ${url.substring(0, 90)}...`);
                     } else {
-                        updateStatus('🟡 解析成功，但URL格式无效，将回退到网络监听。');
+                        updateStatus('❕ 解析成功，但URL格式无效，将回退到网络监听。');
                     }
                 } else {
-                    updateStatus('🟡 页面中未找到player_aaaa对象，将回退到网络监听。');
+                    updateStatus('❕ 页面中未找到player_aaaa对象，将回退到网络监听。');
                 }
             } catch (e) {
                 // 提供非常详细的错误诊断信息
                 let errorType = e.name; // e.g., "SyntaxError"
                 let errorMessage = e.message; // e.g., "Unexpected token"
                 
-                let diagnosticMessage = `🟡 直接解析时出错: ${errorType}: ${errorMessage}`;
+                let diagnosticMessage = `❕ 直接解析时出错: ${errorType}: ${errorMessage}`;
                 
                 // 如果我们成功提取了字符串但eval失败了，就把这个字符串片段包含在日志里
                 if (objectString) {
