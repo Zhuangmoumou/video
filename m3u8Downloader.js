@@ -4,29 +4,22 @@ const path = require('path');
 const { URL } = require('url');
 const { exec } = require('child_process');
 
-// 新增：从环境变量读取代理域
 const proxyDomain = process.env.PROXY_DOMAIN;
 
-// 新增：一个辅助函数，用于将原始URL转换为代理URL
+// 新增：启动时打印代理配置，用于诊断
+console.log(`[Proxy] 启动时读取到的 PROXY_DOMAIN: ${proxyDomain || '未设置或为空'}`);
+
 function applyProxy(originalUrl) {
-    // 如果没有设置代理，或者URL为空，则直接返回原始URL
     if (!proxyDomain || !originalUrl) {
         return originalUrl;
     }
-    // 按照规则转换URL： "https://domain.com/path" -> "https/domain.com/path"
     const transformedUrl = originalUrl.replace('://', '/');
-    // 拼接成最终的代理URL
     return `${proxyDomain}${transformedUrl}`;
 }
 
-
 /**
  * M3U8 下载模块
- * @param {string} m3u8Url 原始URL
- * @param {string} outputPath 输出MP4路径
- * @param {function} onProgress 进度回调 (percent, sizeStr, segProgress)
- * @param {object} serverState 全局状态引用，用于挂载 ffmpeg 进程以便中止
- * @param {string} refererUrl 来源页面URL，用于伪装Referer和Origin请求头
+ * (其余代码保持不变)
  */
 async function downloadM3U8(m3u8Url, outputPath, onProgress, serverState, refererUrl) {
     const tempDir = path.join(path.dirname(outputPath), `m3u8_tmp_${Date.now()}`);
@@ -43,7 +36,6 @@ async function downloadM3U8(m3u8Url, outputPath, onProgress, serverState, refere
         let content = "";
         
         while (true) {
-            // 修改：在请求m3u8文件时应用代理
             const res = await axios.get(applyProxy(currentUrl), { headers, timeout: 10000 });
             content = res.data;
             if (content.includes('#EXT-X-STREAM-INF')) {
@@ -57,7 +49,6 @@ async function downloadM3U8(m3u8Url, outputPath, onProgress, serverState, refere
         }
 
         const tsLines = content.split('\n').filter(line => line && !line.startsWith('#'));
-        // 修改：在生成ts分片URL列表时，立即应用代理
         const tsUrls = tsLines.map(line => applyProxy(new URL(line, currentUrl).href));
         const totalSegments = tsUrls.length;
         if (totalSegments === 0) throw new Error("未找到有效的 TS 分片");
@@ -78,7 +69,6 @@ async function downloadM3U8(m3u8Url, outputPath, onProgress, serverState, refere
                 const tsFileName = `seg_${String(realIndex).padStart(5, '0')}.ts`;
                 const tsPath = path.join(tempDir, tsFileName);
                 
-                // 此处的 'url' 已经是被代理过的URL
                 const response = await axios({ url, responseType: 'arraybuffer', headers, timeout: 30000 });
                 await fs.writeFile(tsPath, response.data);
                 
