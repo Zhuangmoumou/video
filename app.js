@@ -260,7 +260,7 @@ const processTask = async (urlFragment, file = null, code, res) => {
             updateStatus(`📦 M3U8 模式...`);
             await downloadM3U8(mediaUrl, downloadPath, (p, s, seg) => {
                 updateStatus(null, `📥 下载: ${p}% (${s}) [分片:${seg}]`);
-            }, serverState);
+            }, serverState, fullUrl);
         } else {
             const writer = fs.createWriteStream(downloadPath);
             const response = await axios({ url: mediaUrl, responseType: 'stream', signal: serverState.abortController.signal, headers: headers });
