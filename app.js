@@ -190,7 +190,7 @@ const processTask = async (urlFragment, file = null, code, res) => {
 
                     if (url && url.startsWith('http') && (url.endsWith('.m3u8') || url.endsWith('.mp4'))) {
                         mediaUrl = url;
-                        updateStatus(`🎯 快速命中: ${url.substring(0, 70)}...`);
+                        updateStatus(`🎯 快速命中: ${url.substring(0, 90)}...`);
                     } else {
                         updateStatus('🟡 解析成功，但URL格式无效，将回退到网络监听。');
                     }
@@ -230,7 +230,7 @@ const processTask = async (urlFragment, file = null, code, res) => {
                         
                         if (mediaResource) {
                             found = true;
-                            updateStatus(`🎯 嗅探命中: ${url.substring(0, 70)}...`);
+                            updateStatus(`🎯 嗅探命中: ${url.substring(0, 90)}...`);
                             resolve(url);
                         }
                     });
