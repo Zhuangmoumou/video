@@ -58,6 +58,8 @@ jobs:
           sudo cloudflared service install $API_KEY
 
       - name: Start App
+        env:
+          PROXY_DOMAIN: ${{ secrets.PROXY_DOAMAIN }}
           # 运行 Node.js 应用
           # 如果 app.js 是一个 Web 服务器，它将保持运行直到 Action 超时
         run: |
