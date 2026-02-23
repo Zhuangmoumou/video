@@ -51,11 +51,10 @@ jobs:
 
       # 7. 启动隧道
       - name: Start Tunnel
-        env:
-          CF_TOKEN: "eyJhIjoiZDg5ZDIwZmE5NjYxOGQ1NjVkYzY1NGNhNzAwMzAyY2IiLCJ0IjoiNTIxZjA0NzctOWE5MS00NjgzLTk5MmEtM2JmMzEyNzViMTI0IiwicyI6Ik9EZGhZV1V3TWpNdE5qSmpZaTAwTldFNExXSXdPR0V0TW1Zd09ERTNaREUwTlRZdyJ9"
+        env: # 定义环境变量
+          API_KEY: ${{ secrets.CF_TOKEN }}
         run: |
-          # 后台启动 Cloudflare Tunnel
-          # 使用 nohup 或 & 确保它不会阻塞后续命令
+          # 以服务挂载后台启动 Cloudflare Tunnel
           sudo cloudflared service install $CF_TOKEN
 
       - name: Start App
