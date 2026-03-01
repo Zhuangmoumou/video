@@ -217,6 +217,9 @@ const processTask = async (urlFragment, file = null, code, res) => {
             // === 修复结束 ===
 
             if (!mediaUrl) {
+                updateStatus(null, '📡 快速获取失败，重新加载页面并启动网络监听...');
+            // 重新加载页面，以确保能捕获到所有网络请求
+                await page.reload({ waitUntil: 'domcontentloaded', timeout: 45000 });
                 updateStatus('📡 启动网络监听以嗅探链接...');
                 updateStatus(null, "等待资源出现...");
                 let found = false;
