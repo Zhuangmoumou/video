@@ -338,7 +338,7 @@ app.post('/', async (req, res) => {
         await killAndReset();
         if (body === 'rm' || body.rm) {
             const deleted = await forceCleanFiles();
-            res.write(JSON.stringify({ "type": "stop", "stop": info, "del": deleted }) + '\n');
+            res.write(JSON.stringify({ "type": "rm", "stop": info, "del": deleted }) + '\n');
         } else {
             res.write(JSON.stringify({ "type": "stop", "stop": info }) + '\n');
         }
