@@ -63,4 +63,17 @@ jobs:
           # 运行 Node.js 应用
           # 如果 app.js 是一个 Web 服务器，它将保持运行直到 Action 超时
         run: |
-          node app.js
+          node app.js &
+          APP_PID=$!
+          echo "应用程序启动 PID: $APP_PID"
+        
+          echo "计时器开始，应用程序将运行5小时。"
+            # 等待 5 小时
+          sleep 5h
+        
+          echo "时间已到，正在终止应用程序(PID:$APP_PID)..."
+            # 使用 kill 命令终止指定的进程
+            # 我们会先尝试正常终止(SIGTERM)，如果失败了再强制终止(SIGKILL)，确保进程一定会被关闭
+          kill $APP_PID || kill -9 $APP_PID
+        
+          echo "应用程序已成功终止。工作现在将完成。"
