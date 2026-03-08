@@ -124,12 +124,9 @@ const processTask = async (urlFragment, file = null, code, res) => {
         fullUrl = `https://www.mgnacg.com/bangumi/${urlFragment}`;
     }
 
-    // 2. 安全生成文件名：
-    // 如果是 URL 且未传入文件名，提取最后一段或使用 code 命名，防止非法字符导致保存失败
     let fileName;
     if (!file) {
         if (urlFragment.startsWith('http')) {
-            // 提取 URL 中最后一段作为文件名，并过滤掉非法字符
             const urlObj = new URL(fullUrl);
             const pathName = urlObj.pathname.split('/').pop() || 'video';
             fileName = `${code}_${pathName.replace(/[^a-z0-9]/gi, '_')}.mp4`;
@@ -139,14 +136,21 @@ const processTask = async (urlFragment, file = null, code, res) => {
     } else {
         fileName = `${file}.mp4`;
     }
+
     const downloadPath = path.join(ROOT_DIR, fileName);
     const outPath = path.join(OUT_DIR, fileName);
-    serverState.res = res; 
+    serverState.res = res;
     let logHistory = [];
 
     const updateStatus = (newLogMsg, dynamicStatus = "") => {
-        if (newLogMsg) { logHistory.push(newLogMsg); console.log(`[T ${code}] ${newLogMsg}`); }
-        if (dynamicStatus) { serverState.progressStr = dynamicStatus; console.log(`[进程] ${dynamicStatus}`); }
+        if (newLogMsg) {
+            logHistory.push(newLogMsg);
+            console.log(`[T ${code}] ${newLogMsg}`);
+        }
+        if (dynamicStatus) {
+            serverState.progressStr = dynamicStatus;
+            console.log(`[进程] ${dynamicStatus}`);
+        }
         if (serverState.res && !serverState.res.writableEnded) {
             const fullContent = logHistory.join('\n\n') + (dynamicStatus ? `\n\n ${dynamicStatus}` : '');
             serverState.res.write(JSON.stringify({ type: "msg", content: fullContent }) + '\n');
@@ -157,174 +161,226 @@ const processTask = async (urlFragment, file = null, code, res) => {
         serverState.currentTask = '浏览器解析';
         updateStatus(`🚀 任务开始 (${code})`);
         updateStatus(null, "🌏 等待浏览器启动");
-        const browser = await chromium.launch({ headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-blink-features=AutomationControlled', '--disable-infobars'] });
+
+        const browser = await chromium.launch({
+            headless: true,
+            args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-blink-features=AutomationControlled',
+                '--disable-infobars'
+            ]
+        });
         serverState.browser = browser;
-        
+
         let mediaUrl = null;
 
         try {
-            //const context = await browser.newContext({
-              // userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36'
-            //});
+            const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
+
             const context = await browser.newContext({
-              userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-              viewport: { width: 1366, height: 768 },
-              locale: 'zh-CN',
-              timezoneId: 'Asia/Shanghai',
-              deviceScaleFactor: 1,
-              hasTouch: false,
-              javaScriptEnabled: true,
+                userAgent: UA,
+                viewport: { width: 1366, height: 768 },
+                locale: 'zh-CN',
+                timezoneId: 'Asia/Shanghai',
+                deviceScaleFactor: 1,
+                hasTouch: false,
+                javaScriptEnabled: true,
             });
+
             await context.addInitScript(() => {
-              Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-              window.chrome = window.chrome || { runtime: {} };
-              Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'] });
-              Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                window.chrome = window.chrome || { runtime: {} };
+                Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'] });
+                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
             });
+
             const page = await context.newPage();
+
+            // 先挂监听，再 goto（关键）
+            let foundBySniff = false;
+            const findMediaPromise = new Promise((resolve) => {
+                page.on('response', (response) => {
+                    if (foundBySniff) return;
+                    const url = response.url();
+                    const contentType = (response.headers()['content-type'] || '').toLowerCase();
+                    const resourceType = response.request().resourceType();
+
+                    const mediaResource =
+                        resourceType === 'media' ||
+                        url.split('?')[0].endsWith('.m3u8') ||
+                        url.split('?')[0].endsWith('.mp4') ||
+                        contentType.includes('application/vnd.apple.mpegurl') ||
+                        contentType.includes('mpegurl') ||
+                        contentType.includes('video/mp4') ||
+                        contentType.includes('media');
+
+                    if (mediaResource) {
+                        foundBySniff = true;
+                        updateStatus(`🎯 嗅探命中: ${url.substring(0, 90)}...`);
+                        resolve(url);
+                    }
+                });
+            });
+
             updateStatus(`🔗 打开页面: ${fullUrl}`);
-            await page.goto(fullUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
+            const navResp = await page.goto(fullUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
+
+            // 诊断信息，方便判断是不是挑战页/空响应
+            try {
+                const status = navResp ? navResp.status() : 'N/A';
+                const finalUrl = page.url();
+                updateStatus(`🌐 导航状态: ${status} | 最终URL: ${finalUrl}`);
+            } catch (_) {}
+
             await page.waitForTimeout(2500);
 
             const pageTitle = await page.title().catch(() => '未知标题');
             updateStatus(`📄 页面标题: ${pageTitle}`);
 
-            // === 最终修复：更精确的正则表达式和详细的错误诊断 ===
+            // 快速 HTML 解析
             updateStatus('尝试直接解析HTML以快速获取链接...');
-            let objectString = null; // 用于存储匹配到的对象字符串，以便调试
+            let objectString = null;
             try {
                 const htmlContent = await page.content();
-                // 更精确的正则表达式:
-                // 匹配从 "var player_aaaa = {" 开始，到第一个 "}" 结束，并且后面紧跟着 "</script>"
-                // 这能确保我们不会错误地匹配到页面其他地方的内容
-                const regex = new RegExp("var player_aaaa\\s*=\\s*({[\\s\\S]*?})\\s*<\/script>");
+                const regex = new RegExp("var player_aaaa\\s*=\\s*({[\\s\\S]*?})\\s*<\\/script>");
                 const match = htmlContent.match(regex);
-                
+
                 if (match && match[1]) {
-                    objectString = match[1]; // 获取匹配的组
-                    
+                    objectString = match[1];
                     const playerData = eval('(' + objectString + ')');
                     const url = playerData.url;
 
-                    if (url && url.startsWith('http') && (url.endsWith('.m3u8') || url.endsWith('.mp4'))) {
+                    if (url && url.startsWith('http') && (url.includes('.m3u8') || url.includes('.mp4'))) {
                         mediaUrl = url;
                         updateStatus(`🎯 快速命中: ${url.substring(0, 90)}...`);
                     } else {
-                        updateStatus('❕ 解析成功，但URL格式无效，将回退到网络监听。');
+                        updateStatus('❕ 解析成功，但URL格式无效，继续等待网络嗅探。');
                     }
                 } else {
-                    updateStatus('❕ 页面中未找到player_aaaa对象，将回退到网络监听。');
+                    updateStatus('❕ 页面中未找到player_aaaa对象，继续等待网络嗅探。');
                 }
             } catch (e) {
-                // 提供非常详细的错误诊断信息
-                let errorType = e.name; // e.g., "SyntaxError"
-                let errorMessage = e.message; // e.g., "Unexpected token"
-                
-                let diagnosticMessage = `❕ 直接解析时出错: ${errorType}: ${errorMessage}`;
-                
-                // 如果我们成功提取了字符串但eval失败了，就把这个字符串片段包含在日志里
+                let diagnosticMessage = `❕ 直接解析时出错: ${e.name}: ${e.message}`;
                 if (objectString) {
-                    diagnosticMessage += `\n\n[调试信息] 解析失败的文本片段(前200字符):\n${objectString.substring(0, 200)}`;
+                    diagnosticMessage += `\n\n[调试信息] 解析失败片段(前200字符):\n${objectString.substring(0, 200)}`;
                 } else {
-                    diagnosticMessage += `\n\n[调试信息] 正则表达式未能从HTML中匹配到player_aaaa对象。`;
+                    diagnosticMessage += `\n\n[调试信息] 正则未匹配到player_aaaa对象。`;
                 }
-                
-                diagnosticMessage += "\n\n将回退到网络监听。";
+                diagnosticMessage += "\n\n将继续网络监听。";
                 updateStatus(diagnosticMessage);
             }
-            // === 修复结束 ===
 
+            // 如果快速解析没拿到，等嗅探结果
             if (!mediaUrl) {
-                updateStatus(null, '📡 快速获取失败，重新加载页面并启动网络监听...');
-            // 重新加载页面，以确保能捕获到所有网络请求
-                await page.reload({ waitUntil: 'domcontentloaded', timeout: 45000 });
-                updateStatus('📡 启动网络监听以嗅探链接...');
-                updateStatus(null, "等待资源出现...");
-                let found = false;
-                const findMediaPromise = new Promise((resolve) => {
-                    page.on('response', (response) => {
-                        if (found) return;
-                        const url = response.url();
-                        const contentType = response.headers()['content-type'] || '';
-                        const resourceType = response.request().resourceType();
-                        const mediaResource = resourceType === 'media' || url.split('?')[0].endsWith('.m3u8') || contentType.includes('video/mp4') || contentType.includes('media') || url.split('?')[0].endsWith('.mp4');
-                        
-                        if (mediaResource) {
-                            found = true;
-                            updateStatus(`🎯 嗅探命中: ${url.substring(0, 90)}...`);
-                            resolve(url);
-                        }
-                    });
-                });
+                updateStatus('📡 等待网络监听命中媒体资源...');
                 mediaUrl = await Promise.race([
-                    findMediaPromise, 
-                    new Promise((_, r) => setTimeout(() => r(new Error('嗅探超时')), 30000))
+                    findMediaPromise,
+                    new Promise((_, reject) => setTimeout(() => reject(new Error('嗅探超时')), 30000))
                 ]);
             }
-        } finally { 
-            if (browser) { await browser.close(); }
-            serverState.browser = null; 
+        } finally {
+            if (browser) {
+                await browser.close();
+            }
+            serverState.browser = null;
         }
 
         if (!mediaUrl) {
             throw new Error("无法通过任何方式找到有效的视频链接。");
         }
-        
+
         const headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
         };
+
         const isM3U8 = mediaUrl.includes('.m3u8');
         serverState.currentTask = isM3U8 ? 'M3U8下载' : 'MP4下载';
         serverState.abortController = new AbortController();
 
         if (isM3U8) {
             updateStatus(`📦 M3U8 模式...`);
-            await downloadM3U8(mediaUrl, downloadPath, (p, s, seg) => {
-                updateStatus(null, `📥 下载: ${p}% (${s}) [分片:${seg}]`);
-            }, serverState, fullUrl);
+            await downloadM3U8(
+                mediaUrl,
+                downloadPath,
+                (p, s, seg) => {
+                    updateStatus(null, `📥 下载: ${p}% (${s}) [分片:${seg}]`);
+                },
+                serverState,
+                fullUrl
+            );
         } else {
             const writer = fs.createWriteStream(downloadPath);
-            const response = await axios({ url: mediaUrl, responseType: 'stream', signal: serverState.abortController.signal, headers: headers });
-            
+            const response = await axios({
+                url: mediaUrl,
+                responseType: 'stream',
+                signal: serverState.abortController.signal,
+                headers
+            });
+
             const total = parseInt(response.headers['content-length'] || '0', 10);
-            const totalMB = (total / 1024 / 1024).toFixed(2); 
-            
+            const totalMB = (total / 1024 / 1024).toFixed(2);
+
             let curr = 0, lastP = -1, lastT = 0;
-            
             response.data.on('data', (c) => {
                 curr += c.length;
                 const p = total ? Math.floor((curr / total) * 100) : 0;
                 const now = Date.now();
-                
+
                 if (p > lastP && (now - lastT > 300)) {
-                    lastP = p; 
+                    lastP = p;
                     lastT = now;
                     const currMB = (curr / 1024 / 1024).toFixed(2);
                     updateStatus(null, `📥 下载: ${p}% (${currMB}/${totalMB}MB)`);
                 }
             });
-            
+
             response.data.pipe(writer);
-            await new Promise((resolve, reject) => { writer.on('finish', resolve); writer.on('error', reject); });
+            await new Promise((resolve, reject) => {
+                writer.on('finish', resolve);
+                writer.on('error', reject);
+            });
         }
 
         serverState.currentTask = 'FFmpeg压缩';
         updateStatus(null, `📦 压缩中...`);
+
         await new Promise((resolve, reject) => {
-            const cmd = ffmpeg(downloadPath).outputOptions(['-vf', 'scale=320:170:force_original_aspect_ratio=decrease,pad=320:170:(ow-iw)/2:(oh-ih)/2','-c:v', 'libx264', '-crf', '17', '-preset', 'medium', '-c:a', 'copy']).save(outPath);
+            const cmd = ffmpeg(downloadPath)
+                .outputOptions([
+                    '-vf', 'scale=320:170:force_original_aspect_ratio=decrease,pad=320:170:(ow-iw)/2:(oh-ih)/2',
+                    '-c:v', 'libx264',
+                    '-crf', '17',
+                    '-preset', 'medium',
+                    '-c:a', 'copy'
+                ])
+                .save(outPath);
+
             serverState.ffmpegCommand = cmd;
+
             cmd.on('progress', (p) => {
                 const outMB = (p.targetSize / 1024).toFixed(2);
                 updateStatus(null, `📦 压缩: ${Math.floor(p.percent || 0)}% (${outMB}MB)`);
             });
-            cmd.on('end', resolve); cmd.on('error', reject);
+            cmd.on('end', resolve);
+            cmd.on('error', reject);
         });
+
         updateStatus("✅ 任务完成\n\n");
-        if (!res.writableEnded) res.write(JSON.stringify({ "type": "url", "url": `https://${res.req.headers.host}/dl/${fileName}` }) + '\n');
+        if (!res.writableEnded) {
+            res.write(JSON.stringify({
+                type: "url",
+                url: `https://${res.req.headers.host}/dl/${fileName}`
+            }) + '\n');
+        }
     } catch (error) {
-        if (res && !res.writableEnded) res.write(JSON.stringify({ "type": "error", "error": error.toString() }) + '\n');
-        console.error('[Task Error]', error); 
-    } finally { await killAndReset(); }
+        if (res && !res.writableEnded) {
+            res.write(JSON.stringify({ type: "error", error: error.toString() }) + '\n');
+        }
+        console.error('[Task Error]', error);
+    } finally {
+        await killAndReset();
+    }
 };
 
 // === 路由入口 ===
