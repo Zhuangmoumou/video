@@ -217,7 +217,7 @@ const processTask = async (urlFragment, file = null, code, res) => {
 
                     if (mediaResource) {
                         foundBySniff = true;
-                        updateStatus(`🎯 嗅探命中: ${url.substring(0, 90)}...`);
+                        updateStatus(`🎯 嗅探命中: ${url.substring(0, 90)}`);
                         resolve(url);
                     }
                 });
@@ -253,7 +253,7 @@ const processTask = async (urlFragment, file = null, code, res) => {
 
                     if (url && url.startsWith('http') && (url.includes('.m3u8') || url.includes('.mp4'))) {
                         mediaUrl = url;
-                        updateStatus(`🎯 快速命中: ${url.substring(0, 90)}...`);
+                        updateStatus(`🎯 快速命中: ${url.substring(0, 90)}`);
                     } else {
                         updateStatus('❕ 解析成功，但URL格式无效，继续等待网络嗅探。');
                     }
