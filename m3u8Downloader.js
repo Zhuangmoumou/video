@@ -27,7 +27,7 @@ async function downloadM3U8(m3u8Url, outputPath, onProgress, serverState, refere
 
     try {
         const headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
             'Referer': refererUrl,
             'Origin': new URL(refererUrl).origin
         };

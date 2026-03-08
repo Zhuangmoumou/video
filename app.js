@@ -1,5 +1,7 @@
 const express = require('express');
-const { chromium } = require('playwright');
+const { chromium } = require('playwright-extra');
+const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+chromium.use(StealthPlugin());
 const ffmpeg = require('fluent-ffmpeg');
 const axios = require('axios');
 const fs = require('fs-extra');
@@ -161,13 +163,29 @@ const processTask = async (urlFragment, file = null, code, res) => {
         let mediaUrl = null;
 
         try {
+            //const context = await browser.newContext({
+              // userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36'
+            //});
             const context = await browser.newContext({
-                userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36'
+              userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+              viewport: { width: 1366, height: 768 },
+              locale: 'zh-CN',
+              timezoneId: 'Asia/Shanghai',
+              deviceScaleFactor: 1,
+              hasTouch: false,
+              javaScriptEnabled: true,
+            });
+            await context.addInitScript(() => {
+              Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+              window.chrome = window.chrome || { runtime: {} };
+              Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'] });
+              Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
             });
             const page = await context.newPage();
             updateStatus(`🔗 打开页面: ${fullUrl}`);
             await page.goto(fullUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
-            
+            await page.waitForTimeout(2500);
+
             const pageTitle = await page.title().catch(() => '未知标题');
             updateStatus(`📄 页面标题: ${pageTitle}`);
 
@@ -253,7 +271,7 @@ const processTask = async (urlFragment, file = null, code, res) => {
         }
         
         const headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
         };
         const isM3U8 = mediaUrl.includes('.m3u8');
         serverState.currentTask = isM3U8 ? 'M3U8下载' : 'MP4下载';
