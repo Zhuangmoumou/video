@@ -377,7 +377,7 @@ const processTask = async (urlFragment, file = null, code, res) => {
         if (res && !res.writableEnded) {
             res.write(JSON.stringify({ type: "error", error: error.toString() }) + '\n');
         }
-        console.error('[Task Error]', error);
+        console.error('[Task Error]', error?.stack || error?.message || error);
     } finally {
         await killAndReset();
     }
