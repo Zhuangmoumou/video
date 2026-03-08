@@ -410,7 +410,7 @@ app.post('/', async (req, res) => {
     }
 
     // 停止或清理
-    if (body === 'rm' || body.rm || body === 'stop') {
+    if (body === 'rm' || body.rm || body === 'stop' || body.stop) {
         const info = serverState.isBusy ? { code: serverState.currentCode, task: serverState.currentTask } : "无任务";
         await killAndReset();
         if (body === 'rm' || body.rm) {
