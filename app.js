@@ -217,7 +217,7 @@ const processTask = async (urlFragment, file = null, code, res) => {
 
                     if (mediaResource) {
                         foundBySniff = true;
-                        updateStatus(`🎯 嗅探命中: ${url.substring(0, 90)}`);
+                        updateStatus(`🎯 嗅探命中: ${url.substring(0, 50)}...`);
                         resolve(url);
                     }
                 });
@@ -226,12 +226,6 @@ const processTask = async (urlFragment, file = null, code, res) => {
             updateStatus(`🔗 打开页面: ${fullUrl}`);
             const navResp = await page.goto(fullUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
 
-            // 诊断信息，方便判断是不是挑战页/空响应
-            try {
-                const status = navResp ? navResp.status() : 'N/A';
-                const finalUrl = page.url();
-                updateStatus(`🌐 导航状态: ${status} | 最终URL: ${finalUrl}`);
-            } catch (_) {}
 
             await page.waitForTimeout(2500);
 
@@ -253,7 +247,7 @@ const processTask = async (urlFragment, file = null, code, res) => {
 
                     if (url && url.startsWith('http') && (url.includes('.m3u8') || url.includes('.mp4'))) {
                         mediaUrl = url;
-                        updateStatus(`🎯 快速命中: ${url.substring(0, 90)}`);
+                        updateStatus(`🎯 快速命中: ${url.substring(0, 50)}...`);
                     } else {
                         updateStatus('❕ 解析成功，但URL格式无效，继续等待网络嗅探。');
                     }
