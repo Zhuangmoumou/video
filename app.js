@@ -140,6 +140,12 @@ const processTask = async (urlFragment, file = null, code, res) => {
     const downloadPath = path.join(ROOT_DIR, fileName);
     const outPath = path.join(OUT_DIR, fileName);
     serverState.res = res;
+    res.on('close', () => {
+        if (serverState.res === res) {
+            console.log(`[T ${code}] 客户端连接已断开，任务继续执行`);
+            serverState.res = null; // 客户端断开后不再写入
+        }
+    });
     let logHistory = [];
 
     const updateStatus = (newLogMsg, dynamicStatus = "") => {
@@ -151,7 +157,7 @@ const processTask = async (urlFragment, file = null, code, res) => {
             serverState.progressStr = dynamicStatus;
             console.log(`[进程] ${dynamicStatus}`);
         }
-        if (serverState.res && !serverState.res.writableEnded) {
+        if (serverState.res && !serverState.res.writableEnded && !serverState.res.destroyed) {
             const fullContent = logHistory.join('\n\n') + (dynamicStatus ? `\n\n ${dynamicStatus}` : '');
             serverState.res.write(JSON.stringify({ type: "msg", content: fullContent }) + '\n');
         }
@@ -252,7 +258,7 @@ const processTask = async (urlFragment, file = null, code, res) => {
                         updateStatus('❕ 解析成功，但URL格式无效，继续等待网络嗅探。');
                     }
                 } else {
-                    updateStatus('❕ 页面中未找到player_aaaa对象，继续等待网络嗅探。');
+                    updateStatus(null, '❕ 页面中未找到player_aaaa对象，继续等待网络嗅探。');
                 }
             } catch (e) {
                 let diagnosticMessage = `❕ 直接解析时出错: ${e.name}: ${e.message}`;
@@ -291,6 +297,10 @@ const processTask = async (urlFragment, file = null, code, res) => {
         const isM3U8 = mediaUrl.includes('.m3u8');
         serverState.currentTask = isM3U8 ? 'M3U8下载' : 'MP4下载';
         serverState.abortController = new AbortController();
+
+        // 下载前等待2秒
+        updateStatus(null, '⏳ 下载前等待 2 秒...');
+        await new Promise((resolve) => setTimeout(resolve, 2000));
 
         if (isM3U8) {
             updateStatus(`📦 M3U8 模式...`);
@@ -423,7 +433,16 @@ app.post('/', async (req, res) => {
             await killAndReset();
             res.write(JSON.stringify({ type: "msg", content: `任务 ${delCode} 已中止` }) + '\n');
         } else if (serverState.isBusy && serverState.currentCode != delCode) {
-            res.write(JSON.stringify({ type: "error", error: `这不是你的任务：${serverState.currentCode}，无法终止\n\n进度：${serverState.currentTask}\n\n${serverState.progressStr}` }) + '\n');
+            const extraInfo = [
+                serverState.currentTask ? `任务: ${serverState.currentTask}` : null,
+                serverState.progressStr ? `进度: ${serverState.progressStr}` : null
+            ].filter(Boolean).join('\n\n');
+
+            const errorMsg = extraInfo
+                ? `这不是你的任务：${serverState.currentCode}，无法终止\n\n${extraInfo}`
+                : `这不是你的任务：${serverState.currentCode}，无法终止`;
+
+            res.write(JSON.stringify({ type: "error", error: errorMsg }) + '\n');
         } else {
             res.write(JSON.stringify({ "type": "error",  error: "无任务运行" }) + '\n');
         }
@@ -433,11 +452,24 @@ app.post('/', async (req, res) => {
     // 新建任务
     if (body.url && body.code) {
         if (serverState.isBusy) {
-            res.write(JSON.stringify({ "type": "error", "error": `忙碌中: ${serverState.currentCode}` }) + '\n');
+            const extraInfo = [
+                serverState.currentTask ? `任务: ${serverState.currentTask}` : null,
+                serverState.progressStr ? `进度: ${serverState.progressStr}` : null
+            ].filter(Boolean).join('\n\n');
+
+            const errorMsg = extraInfo
+                ? `忙碌中: ${serverState.currentCode}\n\n${extraInfo}`
+                : `忙碌中: ${serverState.currentCode}`;
+
+            res.write(JSON.stringify({
+                "type": "error",
+                "error": errorMsg
+            }) + '\n');
             res.end(); return;
         }
         serverState.isBusy = true;
         serverState.currentCode = Number(body.code);
+        res.setTimeout(0); // 禁用响应超时，避免长任务中断
         processTask(body.url, body.file || null, serverState.currentCode, res);
         return;
     }
@@ -446,4 +478,7 @@ app.post('/', async (req, res) => {
     res.end();
 });
 
-app.listen(PORT, () => console.log(`=== 视频服务器启动于 ${PORT} ===`));
+const server = app.listen(PORT, () => console.log(`=== 视频服务器启动于 ${PORT} ===`));
+// 关闭默认超时，避免长下载/压缩导致连接被动断开
+server.requestTimeout = 0;
+server.headersTimeout = 0;
