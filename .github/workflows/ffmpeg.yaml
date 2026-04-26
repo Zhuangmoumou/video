@@ -50,14 +50,14 @@ jobs:
           npx playwright install chromium --with-deps
 
       # 7. 启动隧道
-      - name: Start Tunnel
+      - name: Start Tunnel（开启隧道）
         env: # 定义环境变量
           API_KEY: ${{ secrets.CF_TOKEN }}
         run: |
           # 以服务挂载后台启动 Cloudflare Tunnel
           sudo cloudflared service install $API_KEY
 
-      - name: Start App
+      - name: Start App（开始运行）
         env:
           PROXY_DOMAIN: ${{ secrets.PROXY_DOMAIN }}
           # 运行 Node.js 应用
