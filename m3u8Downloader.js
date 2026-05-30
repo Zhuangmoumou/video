@@ -36,7 +36,11 @@ async function downloadM3U8(m3u8Url, outputPath, onProgress, serverState, refere
         let content = "";
         
         while (true) {
-            const res = await axios.get(applyProxy(currentUrl), { headers, timeout: 10000 });
+            const res = await axios.get(applyProxy(currentUrl), {
+                headers,
+                timeout: 10000,
+                signal: serverState.abortController?.signal
+            });
             content = res.data;
             if (content.includes('#EXT-X-STREAM-INF')) {
                 const lines = content.split('\n');
@@ -69,7 +73,13 @@ async function downloadM3U8(m3u8Url, outputPath, onProgress, serverState, refere
                 const tsFileName = `seg_${String(realIndex).padStart(5, '0')}.ts`;
                 const tsPath = path.join(tempDir, tsFileName);
                 
-                const response = await axios({ url, responseType: 'arraybuffer', headers, timeout: 30000 });
+                const response = await axios({
+                    url,
+                    responseType: 'arraybuffer',
+                    headers,
+                    timeout: 30000,
+                    signal: serverState.abortController?.signal
+                });
                 await fs.writeFile(tsPath, response.data);
                 
                 totalBytes += response.data.length;
