@@ -57,14 +57,14 @@ jobs:
       # 7. 安装 Playwright 所需系统依赖
       - name: Install Playwright system deps
         run: |
-          pnpm exec playwright install-deps chromium --only-shell
+          pnpm exec playwright install-deps chromium
 
       # 8. 安装 Playwright 浏览器内核
       - name: Install Playwright Chromium
         env:
           DEBUG: pw:install
         run: |
-          pnpm exec playwright install chromium
+          pnpm exec playwright install chromium --only-shell
 
       # 9. 启动隧道
       - name: Start Tunnel（开启隧道）
