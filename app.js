@@ -168,7 +168,7 @@ const processTask = async (urlFragment, file = null, code, res) => {
         updateStatus(`🚀 任务开始 (${code})`);
         updateStatus(null, "🌏 等待浏览器启动");
 
-        const browser = await chromium.launch({
+        const launchOptions = {
             headless: true,
             args: [
                 '--no-sandbox',
@@ -176,7 +176,12 @@ const processTask = async (urlFragment, file = null, code, res) => {
                 '--disable-blink-features=AutomationControlled',
                 '--disable-infobars'
             ]
-        });
+        };
+        if (process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH) {
+            launchOptions.executablePath = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH;
+        }
+
+        const browser = await chromium.launch(launchOptions);
         serverState.browser = browser;
 
         let mediaUrl = null;

@@ -45,28 +45,14 @@ jobs:
           npm install -g pnpm
           pnpm install
 
-      # 6. 缓存 Playwright 浏览器，避免每次都重新下载 Chromium
-      - name: Cache Playwright browsers
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/ms-playwright
-          key: playwright-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}
-          restore-keys: |
-            playwright-${{ runner.os }}-
-
-      # 7. 安装 Playwright 所需系统依赖
-      - name: Install Playwright system deps
+      # 6. 安装系统 Chrome，避免 Playwright 下载和解压浏览器
+      - name: Install Google Chrome
         run: |
-          pnpm exec playwright install-deps chromium
+          wget -q -O google-chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+          sudo apt-get install -y ./google-chrome.deb
+          google-chrome-stable --version
 
-      # 8. 安装 Playwright 浏览器内核
-      - name: Install Playwright Chromium
-        env:
-          DEBUG: pw:install
-        run: |
-          pnpm exec playwright install chromium --only-shell
-
-      # 9. 启动隧道
+      # 7. 启动隧道
       - name: Start Tunnel（开启隧道）
         env: # 定义环境变量
           API_KEY: ${{ secrets.CF_TOKEN }}
@@ -77,6 +63,7 @@ jobs:
       - name: Start App（开始运行）
         env:
           PROXY_DOMAIN: ${{ secrets.PROXY_DOMAIN }}
+          PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH: /usr/bin/google-chrome-stable
           # 运行 Node.js 应用
           # 如果 app.js 是一个 Web 服务器，它将保持运行直到 Action 超时
         run: |
