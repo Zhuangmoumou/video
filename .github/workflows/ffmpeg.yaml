@@ -57,7 +57,7 @@ jobs:
       # 7. 安装 Playwright 所需系统依赖
       - name: Install Playwright system deps
         run: |
-          pnpm exec playwright install-deps chromium
+          pnpm exec playwright install-deps chromium --only-shell
 
       # 8. 安装 Playwright 浏览器内核
       - name: Install Playwright Chromium
