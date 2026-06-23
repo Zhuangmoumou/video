@@ -4,33 +4,62 @@ const path = require('path');
 const { URL } = require('url');
 const { exec } = require('child_process');
 
-const proxyDomain = process.env.PROXY_DOMAIN;
+const proxyDomain = (process.env.PROXY_DOMAIN || '').trim();
 
 // 新增：启动时打印代理配置，用于诊断
 console.log(`[Proxy] 启动时读取到的 PROXY_DOMAIN: ${proxyDomain || '未设置或为空'}`);
+console.log(`[Proxy] 下载代理 DOWNLOAD_PROXY/VIDEO_PROXY: ${(process.env.DOWNLOAD_PROXY || process.env.VIDEO_PROXY) ? '已设置' : '未设置'}`);
+
+const getDownloadProxy = () => (process.env.DOWNLOAD_PROXY || process.env.VIDEO_PROXY || '').trim();
+
+function getAxiosProxyConfig() {
+    const raw = getDownloadProxy();
+    if (!raw) return undefined;
+    const u = new URL(raw);
+    if (!['http:', 'https:'].includes(u.protocol)) {
+        throw new Error('DOWNLOAD_PROXY 只支持 http/https 代理，例如 http://user:pass@host:port');
+    }
+    const cfg = {
+        protocol: u.protocol.slice(0, -1),
+        host: u.hostname,
+        port: Number(u.port || (u.protocol === 'https:' ? 443 : 80))
+    };
+    if (u.username || u.password) {
+        cfg.auth = {
+            username: decodeURIComponent(u.username),
+            password: decodeURIComponent(u.password)
+        };
+    }
+    return cfg;
+}
 
 function applyProxy(originalUrl) {
-    if (!proxyDomain || !originalUrl) {
+    // 两个代理都允许为空：都为空则直连。
+    // DOWNLOAD_PROXY 是真正 HTTP 代理，优先级最高；设置后不再使用 PROXY_DOMAIN 改写 URL，避免双代理冲突。
+    if (getDownloadProxy() || !proxyDomain || !originalUrl) {
         return originalUrl;
     }
-    const transformedUrl = originalUrl.replace('://', '/');
-    return `${proxyDomain}${transformedUrl}`;
+    const prefix = proxyDomain.replace(/\/+$/, '') + '/';
+    return prefix + originalUrl.replace('://', '/');
 }
 
 /**
  * M3U8 下载模块
  * (其余代码保持不变)
  */
-async function downloadM3U8(m3u8Url, outputPath, onProgress, serverState, refererUrl) {
+async function downloadM3U8(m3u8Url, outputPath, onProgress, serverState, refererUrl, browserHeaders = null) {
     const tempDir = path.join(path.dirname(outputPath), `m3u8_tmp_${Date.now()}`);
     await fs.ensureDir(tempDir);
 
     try {
-        const headers = {
+        const headers = browserHeaders || {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+            'Accept': '*/*',
+            'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
             'Referer': refererUrl,
             'Origin': new URL(refererUrl).origin
         };
+        const axiosProxy = getAxiosProxyConfig();
 
         let currentUrl = m3u8Url;
         let content = "";
@@ -39,7 +68,8 @@ async function downloadM3U8(m3u8Url, outputPath, onProgress, serverState, refere
             const res = await axios.get(applyProxy(currentUrl), {
                 headers,
                 timeout: 10000,
-                signal: serverState.abortController?.signal
+                signal: serverState.abortController?.signal,
+                proxy: axiosProxy
             });
             content = res.data;
             if (content.includes('#EXT-X-STREAM-INF')) {
@@ -78,7 +108,8 @@ async function downloadM3U8(m3u8Url, outputPath, onProgress, serverState, refere
                     responseType: 'arraybuffer',
                     headers,
                     timeout: 30000,
-                    signal: serverState.abortController?.signal
+                    signal: serverState.abortController?.signal,
+                    proxy: axiosProxy
                 });
                 await fs.writeFile(tsPath, response.data);
                 

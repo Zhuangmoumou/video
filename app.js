@@ -17,6 +17,74 @@ const OUT_DIR = path.join(ROOT_DIR, 'out');
 fs.ensureDirSync(ROOT_DIR);
 fs.ensureDirSync(OUT_DIR);
 
+const DEFAULT_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
+
+const getDownloadProxy = () => (process.env.DOWNLOAD_PROXY || process.env.VIDEO_PROXY || '').trim();
+const getProxyDomain = () => (process.env.PROXY_DOMAIN || '').trim();
+
+const applyProxyDomain = (originalUrl) => {
+    // 两个代理都允许为空：都为空则直连。
+    // DOWNLOAD_PROXY 是真正 HTTP 代理，优先级最高；设置后不再使用 PROXY_DOMAIN 改写 URL，避免双代理冲突。
+    if (getDownloadProxy() || !getProxyDomain() || !originalUrl) return originalUrl;
+    const prefix = getProxyDomain().replace(/\/+$/, '') + '/';
+    return prefix + originalUrl.replace('://', '/');
+};
+
+const parseProxyUrl = () => {
+    const raw = getDownloadProxy();
+    if (!raw) return null;
+    const u = new URL(raw);
+    if (!['http:', 'https:'].includes(u.protocol)) {
+        throw new Error('DOWNLOAD_PROXY 只支持 http/https 代理，例如 http://user:pass@host:port');
+    }
+    return u;
+};
+
+const getPlaywrightProxyConfig = () => {
+    const u = parseProxyUrl();
+    if (!u) return null;
+    const cfg = { server: `${u.protocol}//${u.hostname}${u.port ? `:${u.port}` : ''}` };
+    if (u.username) cfg.username = decodeURIComponent(u.username);
+    if (u.password) cfg.password = decodeURIComponent(u.password);
+    return cfg;
+};
+
+const getAxiosProxyConfig = () => {
+    const u = parseProxyUrl();
+    if (!u) return null;
+    const cfg = {
+        protocol: u.protocol.slice(0, -1),
+        host: u.hostname,
+        port: Number(u.port || (u.protocol === 'https:' ? 443 : 80))
+    };
+    if (u.username || u.password) {
+        cfg.auth = {
+            username: decodeURIComponent(u.username),
+            password: decodeURIComponent(u.password)
+        };
+    }
+    return cfg;
+};
+
+const buildDownloadHeaders = async (context, refererUrl, mediaUrl) => {
+    let cookieHeader = '';
+    try {
+        const urls = [refererUrl, mediaUrl].filter(Boolean);
+        const cookies = await context.cookies(urls);
+        cookieHeader = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+    } catch (e) {}
+
+    const headers = {
+        'User-Agent': DEFAULT_UA,
+        'Accept': '*/*',
+        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+        'Referer': refererUrl,
+        'Origin': new URL(refererUrl).origin
+    };
+    if (cookieHeader) headers.Cookie = cookieHeader;
+    return headers;
+};
+
 // === 全局异常保护 ===
 process.on('unhandledRejection', (reason) => console.error('[Fatal] Promise拒绝:', reason));
 process.on('uncaughtException', (err) => console.error('[Fatal] 进程异常:', err));
@@ -180,14 +248,20 @@ const processTask = async (urlFragment, file = null, code, res) => {
         if (process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH) {
             launchOptions.executablePath = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH;
         }
+        const browserProxy = getPlaywrightProxyConfig();
+        if (browserProxy) {
+            launchOptions.proxy = browserProxy;
+            updateStatus(null, '🛡 已启用下载代理，浏览器和下载使用同一出口IP');
+        }
 
         const browser = await chromium.launch(launchOptions);
         serverState.browser = browser;
 
         let mediaUrl = null;
+        let downloadHeaders = null;
 
         try {
-            const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
+            const UA = DEFAULT_UA;
 
             const context = await browser.newContext({
                 userAgent: UA,
@@ -284,6 +358,9 @@ const processTask = async (urlFragment, file = null, code, res) => {
                     new Promise((_, reject) => setTimeout(() => reject(new Error('嗅探超时')), 30000))
                 ]);
             }
+
+            downloadHeaders = await buildDownloadHeaders(context, fullUrl, mediaUrl);
+            updateStatus(`🧩 下载指纹已同步: ${downloadHeaders.Cookie ? '含Cookie' : '无Cookie'}`);
         } finally {
             if (browser) {
                 await browser.close();
@@ -295,8 +372,12 @@ const processTask = async (urlFragment, file = null, code, res) => {
             throw new Error("无法通过任何方式找到有效的视频链接。");
         }
 
-        const headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+        const headers = downloadHeaders || {
+            'User-Agent': DEFAULT_UA,
+            'Accept': '*/*',
+            'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+            'Referer': fullUrl,
+            'Origin': new URL(fullUrl).origin
         };
 
         const isM3U8 = mediaUrl.includes('.m3u8');
@@ -316,15 +397,17 @@ const processTask = async (urlFragment, file = null, code, res) => {
                     updateStatus(null, `📥 下载: ${p}% (${s}) [分片:${seg}]`);
                 },
                 serverState,
-                fullUrl
+                fullUrl,
+                headers
             );
         } else {
             const writer = fs.createWriteStream(downloadPath);
             const response = await axios({
-                url: mediaUrl,
+                url: applyProxyDomain(mediaUrl),
                 responseType: 'stream',
                 signal: serverState.abortController.signal,
-                headers
+                headers,
+                proxy: getAxiosProxyConfig() || undefined
             });
 
             const total = parseInt(response.headers['content-length'] || '0', 10);

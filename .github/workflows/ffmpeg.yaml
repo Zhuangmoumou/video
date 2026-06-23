@@ -63,6 +63,7 @@ jobs:
       - name: Start App（开始运行）
         env:
           PROXY_DOMAIN: ${{ secrets.PROXY_DOMAIN }}
+          DOWNLOAD_PROXY: ${{ secrets.DOWNLOAD_PROXY }}
           PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH: /usr/bin/google-chrome-stable
           # 运行 Node.js 应用
           # 如果 app.js 是一个 Web 服务器，它将保持运行直到 Action 超时
