@@ -76,6 +76,15 @@ function formatAxiosError(error, context = '') {
     return lines.join('\n');
 }
 
+const PROGRESS_DEBOUNCE_MS = 5000;
+
+function formatSpeed(bytesPerSec) {
+    if (!Number.isFinite(bytesPerSec) || bytesPerSec <= 0) return '0B/s';
+    if (bytesPerSec >= 1024 * 1024) return `${(bytesPerSec / (1024 * 1024)).toFixed(2)}MB/s`;
+    if (bytesPerSec >= 1024) return `${(bytesPerSec / 1024).toFixed(1)}KB/s`;
+    return `${Math.round(bytesPerSec)}B/s`;
+}
+
 /**
  * M3U8 下载模块
  * (其余代码保持不变)
@@ -129,10 +138,27 @@ async function downloadM3U8(m3u8Url, outputPath, onProgress, serverState, refere
 
         let downloadedCount = 0;
         let totalBytes = 0;
-        let lastPercent = -1;
+        let lastBytes = 0;
+        let lastSpeedTime = Date.now();
         let lastUpdateTime = 0;
         const CONCURRENCY = 8; 
         const ffmpegList = [];
+
+        const reportProgress = (force = false) => {
+            const now = Date.now();
+            if (!force && now - lastUpdateTime < PROGRESS_DEBOUNCE_MS) return;
+
+            const elapsed = Math.max(now - lastSpeedTime, 1);
+            const speed = formatSpeed((totalBytes - lastBytes) * 1000 / elapsed);
+            lastBytes = totalBytes;
+            lastSpeedTime = now;
+            lastUpdateTime = now;
+
+            const percent = Math.floor((downloadedCount / totalSegments) * 100);
+            const currMB = (totalBytes / 1024 / 1024).toFixed(2);
+            const segProgress = `${downloadedCount}/${totalSegments}`;
+            onProgress(percent, `${currMB}MB`, segProgress, speed);
+        };
 
         for (let i = 0; i < tsUrls.length; i += CONCURRENCY) {
             if (serverState.abortController?.signal.aborted) throw new Error("任务被中止");
@@ -162,18 +188,10 @@ async function downloadM3U8(m3u8Url, outputPath, onProgress, serverState, refere
                 totalBytes += response.data.length;
                 downloadedCount++;
                 ffmpegList[realIndex] = `file '${tsFileName}'`;
-
-                const percent = Math.floor((downloadedCount / totalSegments) * 100);
-                const now = Date.now();
-                if (percent > lastPercent && (now - lastUpdateTime > 300)) {
-                    lastPercent = percent;
-                    lastUpdateTime = now;
-                    const currMB = (totalBytes / 1024 / 1024).toFixed(2);
-                    const segProgress = `${downloadedCount}/${totalSegments}`;
-                    onProgress(percent, `${currMB}MB`, segProgress); 
-                }
+                reportProgress(false);
             }));
         }
+        reportProgress(true);
 
         const fileListPath = path.join(tempDir, 'list.txt');
         await fs.writeFile(fileListPath, ffmpegList.join('\n'));

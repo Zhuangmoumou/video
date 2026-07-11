@@ -63,6 +63,109 @@ const formatAxiosError = (error, context = '') => {
     return lines.join('\n');
 };
 
+const PROGRESS_DEBOUNCE_MS = 5000;
+
+const formatSpeed = (bytesPerSec) => {
+    if (!Number.isFinite(bytesPerSec) || bytesPerSec <= 0) return '0B/s';
+    if (bytesPerSec >= 1024 * 1024) return `${(bytesPerSec / (1024 * 1024)).toFixed(2)}MB/s`;
+    if (bytesPerSec >= 1024) return `${(bytesPerSec / 1024).toFixed(1)}KB/s`;
+    return `${Math.round(bytesPerSec)}B/s`;
+};
+
+const sameOrigin = (a, b) => {
+    try {
+        const ua = new URL(a);
+        const ub = new URL(b);
+        return ua.protocol === ub.protocol && ua.host === ub.host;
+    } catch (e) {
+        return false;
+    }
+};
+
+const stripCrossSiteHeaders = (headers = {}) => {
+    const next = { ...headers };
+    delete next.Referer;
+    delete next.referer;
+    delete next.Origin;
+    delete next.origin;
+    delete next.Cookie;
+    delete next.cookie;
+    return next;
+};
+
+const isRedirectStatus = (status) => [301, 302, 303, 307, 308].includes(status);
+
+/**
+ * 下载 MP4：手动跟随 302 中转链。
+ * 跳转到跨站对象存储/网盘时剥离 Referer/Origin/Cookie，避免被 403。
+ */
+const downloadMp4WithRedirects = async (startUrl, headers, signal, proxy) => {
+    let currentUrl = startUrl;
+    let currentHeaders = { ...headers };
+    const maxHops = 10;
+    const hopLog = [];
+
+    // 初始链接已是跨站（相对 Referer）时，首跳就剥离跨站头
+    const initialReferer = currentHeaders.Referer || currentHeaders.referer;
+    if (initialReferer && !sameOrigin(initialReferer, currentUrl)) {
+        currentHeaders = stripCrossSiteHeaders(currentHeaders);
+        hopLog.push(`init strip cross-site headers for ${currentUrl.substring(0, 80)}`);
+    }
+
+    for (let hop = 0; hop < maxHops; hop++) {
+        const requestUrl = applyProxyDomain(currentUrl);
+        let response;
+        try {
+            response = await axios({
+                url: requestUrl,
+                method: 'GET',
+                responseType: 'stream',
+                maxRedirects: 0,
+                validateStatus: (status) => (status >= 200 && status < 400),
+                signal,
+                headers: currentHeaders,
+                proxy: proxy || undefined
+            });
+        } catch (error) {
+            // axios 在 maxRedirects:0 时，部分版本仍把 3xx 当成功；若走 error 且有 response 则继续处理
+            if (error.response && isRedirectStatus(error.response.status)) {
+                response = error.response;
+            } else {
+                console.error('[Axios Error] MP4请求失败\n' + formatAxiosError(error, `mediaUrl=${currentUrl} hop=${hop}`));
+                throw error;
+            }
+        }
+
+        if (isRedirectStatus(response.status)) {
+            const location = response.headers?.location || response.headers?.Location;
+            if (!location) {
+                throw new Error(`MP4 重定向缺少 Location (status=${response.status})`);
+            }
+            // 丢弃 redirect body
+            if (response.data && typeof response.data.destroy === 'function') {
+                response.data.destroy();
+            }
+
+            const nextUrl = new URL(location, currentUrl).href;
+            const crossSite = !sameOrigin(currentUrl, nextUrl);
+            hopLog.push(`${response.status} -> ${nextUrl.substring(0, 80)}${crossSite ? ' [跨站,剥离Referer/Origin/Cookie]' : ''}`);
+
+            if (crossSite) {
+                currentHeaders = stripCrossSiteHeaders(currentHeaders);
+            }
+            currentUrl = nextUrl;
+            continue;
+        }
+
+        if (hopLog.length) {
+            console.log(`[MP4 Redirect] ${hopLog.join(' | ')}`);
+        }
+        return { response, finalUrl: currentUrl, hops: hopLog };
+    }
+
+    throw new Error(`MP4 重定向次数过多(>${maxHops})，可能存在循环跳转`);
+};
+
 const parseProxyUrl = () => {
     const raw = getDownloadProxy();
     if (!raw) return null;
@@ -426,8 +529,9 @@ const processTask = async (urlFragment, file = null, code, res) => {
             await downloadM3U8(
                 mediaUrl,
                 downloadPath,
-                (p, s, seg) => {
-                    updateStatus(null, `📥 下载: ${p}% (${s}) [分片:${seg}]`);
+                (p, s, seg, speed) => {
+                    const speedText = speed ? ` ${speed}` : '';
+                    updateStatus(null, `📥 下载: ${p}% (${s}) [分片:${seg}]${speedText}`);
                 },
                 serverState,
                 fullUrl,
@@ -435,35 +539,37 @@ const processTask = async (urlFragment, file = null, code, res) => {
             );
         } else {
             const writer = fs.createWriteStream(downloadPath);
-            let response;
-            try {
-                response = await axios({
-                    url: applyProxyDomain(mediaUrl),
-                    responseType: 'stream',
-                    signal: serverState.abortController.signal,
-                    headers,
-                    proxy: getAxiosProxyConfig() || undefined
-                });
-            } catch (error) {
-                console.error('[Axios Error] MP4请求失败\n' + formatAxiosError(error, `mediaUrl=${mediaUrl}`));
-                throw error;
+            const { response, finalUrl, hops } = await downloadMp4WithRedirects(
+                mediaUrl,
+                headers,
+                serverState.abortController.signal,
+                getAxiosProxyConfig()
+            );
+            if (hops.length) {
+                updateStatus(`🔀 跟随重定向 ${hops.length} 次: ${finalUrl.substring(0, 80)}...`);
             }
 
             const total = parseInt(response.headers['content-length'] || '0', 10);
             const totalMB = (total / 1024 / 1024).toFixed(2);
 
-            let curr = 0, lastP = -1, lastT = 0;
+            let curr = 0;
+            let lastBytes = 0;
+            let lastT = Date.now();
+            let lastReportT = 0;
             response.data.on('data', (c) => {
                 curr += c.length;
-                const p = total ? Math.floor((curr / total) * 100) : 0;
                 const now = Date.now();
+                if (now - lastReportT < PROGRESS_DEBOUNCE_MS) return;
 
-                if (p > lastP && (now - lastT > 300)) {
-                    lastP = p;
-                    lastT = now;
-                    const currMB = (curr / 1024 / 1024).toFixed(2);
-                    updateStatus(null, `📥 下载: ${p}% (${currMB}/${totalMB}MB)`);
-                }
+                const elapsed = Math.max(now - lastT, 1);
+                const speed = formatSpeed((curr - lastBytes) * 1000 / elapsed);
+                lastBytes = curr;
+                lastT = now;
+                lastReportT = now;
+
+                const p = total ? Math.floor((curr / total) * 100) : 0;
+                const currMB = (curr / 1024 / 1024).toFixed(2);
+                updateStatus(null, `📥 下载: ${p}% (${currMB}/${totalMB}MB) ${speed}`);
             });
 
             response.data.pipe(writer);
@@ -489,7 +595,11 @@ const processTask = async (urlFragment, file = null, code, res) => {
 
             serverState.ffmpegCommand = cmd;
 
+            let lastCompressReportT = 0;
             cmd.on('progress', (p) => {
+                const now = Date.now();
+                if (now - lastCompressReportT < PROGRESS_DEBOUNCE_MS) return;
+                lastCompressReportT = now;
                 const outMB = (p.targetSize / 1024).toFixed(2);
                 updateStatus(null, `📦 压缩: ${Math.floor(p.percent || 0)}% (${outMB}MB)`);
             });
