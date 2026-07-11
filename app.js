@@ -30,6 +30,39 @@ const applyProxyDomain = (originalUrl) => {
     return prefix + originalUrl.replace('://', '/');
 };
 
+const formatAxiosError = (error, context = '') => {
+    const lines = [];
+    const add = (label, value) => {
+        if (value !== undefined && value !== null && value !== '') lines.push(`${label}: ${value}`);
+    };
+
+    if (context) lines.push(context);
+    add('name', error?.name);
+    add('message', error?.message);
+    add('code', error?.code);
+    add('method', error?.config?.method?.toUpperCase());
+    add('url', error?.config?.url);
+    add('timeout', error?.config?.timeout);
+    add('status', error?.response?.status);
+    add('statusText', error?.response?.statusText);
+
+    const cause = error?.cause;
+    if (cause) {
+        add('cause', `${cause.name || 'Error'}: ${cause.message || String(cause)}`);
+        add('cause.code', cause.code);
+        if (Array.isArray(cause.errors)) {
+            cause.errors.forEach((inner, index) => {
+                add(`cause.errors[${index}]`, `${inner.name || 'Error'}: ${inner.message || String(inner)}`);
+                add(`cause.errors[${index}].code`, inner.code);
+                add(`cause.errors[${index}].address`, inner.address);
+                add(`cause.errors[${index}].port`, inner.port);
+            });
+        }
+    }
+
+    return lines.join('\n');
+};
+
 const parseProxyUrl = () => {
     const raw = getDownloadProxy();
     if (!raw) return null;
@@ -402,13 +435,19 @@ const processTask = async (urlFragment, file = null, code, res) => {
             );
         } else {
             const writer = fs.createWriteStream(downloadPath);
-            const response = await axios({
-                url: applyProxyDomain(mediaUrl),
-                responseType: 'stream',
-                signal: serverState.abortController.signal,
-                headers,
-                proxy: getAxiosProxyConfig() || undefined
-            });
+            let response;
+            try {
+                response = await axios({
+                    url: applyProxyDomain(mediaUrl),
+                    responseType: 'stream',
+                    signal: serverState.abortController.signal,
+                    headers,
+                    proxy: getAxiosProxyConfig() || undefined
+                });
+            } catch (error) {
+                console.error('[Axios Error] MP4请求失败\n' + formatAxiosError(error, `mediaUrl=${mediaUrl}`));
+                throw error;
+            }
 
             const total = parseInt(response.headers['content-length'] || '0', 10);
             const totalMB = (total / 1024 / 1024).toFixed(2);

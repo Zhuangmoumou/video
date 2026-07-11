@@ -43,6 +43,39 @@ function applyProxy(originalUrl) {
     return prefix + originalUrl.replace('://', '/');
 }
 
+function formatAxiosError(error, context = '') {
+    const lines = [];
+    const add = (label, value) => {
+        if (value !== undefined && value !== null && value !== '') lines.push(`${label}: ${value}`);
+    };
+
+    if (context) lines.push(context);
+    add('name', error?.name);
+    add('message', error?.message);
+    add('code', error?.code);
+    add('method', error?.config?.method?.toUpperCase());
+    add('url', error?.config?.url);
+    add('timeout', error?.config?.timeout);
+    add('status', error?.response?.status);
+    add('statusText', error?.response?.statusText);
+
+    const cause = error?.cause;
+    if (cause) {
+        add('cause', `${cause.name || 'Error'}: ${cause.message || String(cause)}`);
+        add('cause.code', cause.code);
+        if (Array.isArray(cause.errors)) {
+            cause.errors.forEach((inner, index) => {
+                add(`cause.errors[${index}]`, `${inner.name || 'Error'}: ${inner.message || String(inner)}`);
+                add(`cause.errors[${index}].code`, inner.code);
+                add(`cause.errors[${index}].address`, inner.address);
+                add(`cause.errors[${index}].port`, inner.port);
+            });
+        }
+    }
+
+    return lines.join('\n');
+}
+
 /**
  * M3U8 下载模块
  * (其余代码保持不变)
@@ -65,12 +98,19 @@ async function downloadM3U8(m3u8Url, outputPath, onProgress, serverState, refere
         let content = "";
         
         while (true) {
-            const res = await axios.get(applyProxy(currentUrl), {
-                headers,
-                timeout: 10000,
-                signal: serverState.abortController?.signal,
-                proxy: axiosProxy
-            });
+            const playlistUrl = applyProxy(currentUrl);
+            let res;
+            try {
+                res = await axios.get(playlistUrl, {
+                    headers,
+                    timeout: 10000,
+                    signal: serverState.abortController?.signal,
+                    proxy: axiosProxy
+                });
+            } catch (error) {
+                console.error('[Axios Error] M3U8播放列表请求失败\n' + formatAxiosError(error, `playlist=${currentUrl}`));
+                throw error;
+            }
             content = res.data;
             if (content.includes('#EXT-X-STREAM-INF')) {
                 const lines = content.split('\n');
@@ -103,14 +143,20 @@ async function downloadM3U8(m3u8Url, outputPath, onProgress, serverState, refere
                 const tsFileName = `seg_${String(realIndex).padStart(5, '0')}.ts`;
                 const tsPath = path.join(tempDir, tsFileName);
                 
-                const response = await axios({
-                    url,
-                    responseType: 'arraybuffer',
-                    headers,
-                    timeout: 30000,
-                    signal: serverState.abortController?.signal,
-                    proxy: axiosProxy
-                });
+                let response;
+                try {
+                    response = await axios({
+                        url,
+                        responseType: 'arraybuffer',
+                        headers,
+                        timeout: 30000,
+                        signal: serverState.abortController?.signal,
+                        proxy: axiosProxy
+                    });
+                } catch (error) {
+                    console.error('[Axios Error] TS分片请求失败\n' + formatAxiosError(error, `segment=${realIndex + 1}/${totalSegments}`));
+                    throw error;
+                }
                 await fs.writeFile(tsPath, response.data);
                 
                 totalBytes += response.data.length;
