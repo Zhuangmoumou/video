@@ -344,6 +344,12 @@ app.use(express.json());
 app.use(express.text({ type: '*/*' })); // 允许解析所有类型的文本输入
 app.use(express.urlencoded({ extended: true }));
 app.use('/dl', express.static(OUT_DIR));
+// GET /mod：可用插件列表（含 none）
+app.get('/mod', (req, res) => {
+    const list = ['none', ...mods.keys()];
+    res.json(list);
+});
+
 // GET /log路径，可以直接获取日志
 app.get('/log', (req, res) => {
     const logContent = [
