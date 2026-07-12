@@ -95,6 +95,19 @@ function extractPlayerAaaa(html) {
     }
 }
 
+function extractPageTitle(html) {
+    if (!html) return null;
+    const og = html.match(/<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']/i)
+        || html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:title["']/i);
+    if (og && og[1]) return og[1].trim();
+
+    const titleTag = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+    if (titleTag && titleTag[1]) {
+        return titleTag[1].replace(/\s+/g, ' ').trim();
+    }
+    return null;
+}
+
 /**
  * MacCMS encrypt 字段处理
  * encrypt=1: unescape
@@ -197,6 +210,7 @@ async function download(episodeId, options = {}) {
         headers: { Referer: site + '/' },
     });
     const pageHtml = typeof pageRes.data === 'string' ? pageRes.data : String(pageRes.data);
+    const pageTitle = extractPageTitle(pageHtml);
     const player = extractPlayerAaaa(pageHtml);
     const playUrl = resolvePlayUrl(player);
     if (!playUrl) throw new Error('player_aaaa.url 为空');
@@ -231,6 +245,8 @@ async function download(episodeId, options = {}) {
             lineName: info.line?.name || player.from,
             from: player.from,
             pageUrl,
+            pageTitle,
+            title: pageTitle,
             parseUrl,
             url: mediaUrl,
             player,

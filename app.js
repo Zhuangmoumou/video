@@ -6,8 +6,8 @@ const ffmpeg = require('fluent-ffmpeg');
 const axios = require('axios');
 const fs = require('fs-extra');
 const path = require('path');
-const { exec } = require('child_process');
 const { downloadM3U8 } = require('./m3u8Downloader');
+const { createProgressLimiter, createSpeedAverager } = require('./progressLimiter');
 
 const app = express();
 const PORT = 9898;
@@ -72,13 +72,14 @@ const normalizeModResult = (result) => {
     if (typeof result === 'string') {
         const url = result.trim();
         if (!url) throw new Error('插件返回空 URL');
-        return { mediaUrl: url, refererUrl: null, meta: null };
+        return { mediaUrl: url, refererUrl: null, pageTitle: null, meta: null };
     }
     if (typeof result === 'object') {
         const mediaUrl = (result.url || result.mediaUrl || '').toString().trim();
         if (!mediaUrl) throw new Error('插件返回对象中缺少 url/mediaUrl');
         const refererUrl = result.pageUrl || result.referer || result.refererUrl || null;
-        return { mediaUrl, refererUrl, meta: result };
+        const pageTitle = (result.pageTitle || result.title || result.vod_name || '').toString().trim() || null;
+        return { mediaUrl, refererUrl, pageTitle, meta: result };
     }
     throw new Error(`插件返回了不支持的类型: ${typeof result}`);
 };
@@ -108,6 +109,36 @@ const shortenText = (value, max = 80) => {
     return text.length > max ? `${text.slice(0, max - 3)}...` : text;
 };
 
+const createVideoTaskLock = () => {
+    let owner = null;
+
+    return {
+        tryAcquire(code) {
+            if (owner) return null;
+            owner = {
+                code,
+                startedAt: Date.now()
+            };
+            return owner;
+        },
+        release(token) {
+            if (owner === token) owner = null;
+        },
+        getState() {
+            return owner;
+        }
+    };
+};
+
+const videoTaskLock = createVideoTaskLock();
+
+const getVideoTaskLockStatusLine = () => {
+    const lock = videoTaskLock.getState();
+    if (!lock) return null;
+    const elapsedSec = Math.max(0, Math.floor((Date.now() - lock.startedAt) / 1000));
+    return `视频任务锁: ${lock.code}，已持有 ${elapsedSec}s`;
+};
+
 const getQueueStatusLine = () => {
     const queue = serverState.queue;
     if (!queue || !Array.isArray(queue.items) || queue.items.length <= 1) return null;
@@ -135,8 +166,11 @@ const resolveByMod = async (modName, input, updateStatus) => {
     updateStatus(`🔌 使用插件解析: ${mod.name}`);
     updateStatus(null, `🔌 插件 ${mod.name} 解析中...`);
     console.log(`[Mod] 调用 ${mod.name}.download(${JSON.stringify(String(input).slice(0, 120))})`);
-    const raw = await mod.download(input);
+    const raw = await mod.download(input, { meta: true });
     const parsed = normalizeModResult(raw);
+    if (parsed.pageTitle) {
+        updateStatus(`📄 页面标题: ${parsed.pageTitle}`);
+    }
     updateStatus(`🔌 插件 ${mod.name} 解析成功: ${parsed.mediaUrl.substring(0, 80)}...`);
     return parsed;
 };
@@ -186,8 +220,6 @@ const formatAxiosError = (error, context = '') => {
 
     return lines.join('\n');
 };
-
-const PROGRESS_DEBOUNCE_MS = 5000;
 
 const formatSpeed = (bytesPerSec) => {
     if (!Number.isFinite(bytesPerSec) || bytesPerSec <= 0) return '0B/s';
@@ -387,12 +419,14 @@ app.get('/mod', (req, res) => {
 // GET /log路径，可以直接获取日志
 app.get('/log', (req, res) => {
     const queueStatus = getQueueStatusLine();
+    const lockStatus = getVideoTaskLockStatusLine();
     const logContent = [
         `=== 系统状态 ===`,
         `时间: ${new Date().toLocaleString()}`,
         `状态: ${serverState.isBusy ? '忙碌' : '空闲'}`,
         `任务: ${serverState.currentTask || '无'}`,
         `进度: ${serverState.progressStr || '无'}`,
+        `锁: ${lockStatus || '无'}`,
         `队列: ${queueStatus || '无'}`,
         `\n=== 最近日志 ===`,
         ...logBuffer
@@ -409,6 +443,7 @@ let serverState = {
     currentTask: null,
     progressStr: null,
     queue: null,
+    taskLockToken: null,
     abortController: null,
     ffmpegCommand: null,
     browser: null,
@@ -431,13 +466,21 @@ const releaseCurrentTaskResources = async () => {
 };
 
 const killAndReset = async () => {
-    console.log('[System] 🗑 正在释放资源锁...');
+    console.log('[System] 🗑 正在释放任务资源...');
     await releaseCurrentTaskResources();
     serverState.isBusy = false;
     serverState.currentCode = null;
     serverState.queue = null;
     if (serverState.res && !serverState.res.writableEnded && !serverState.res.destroyed) serverState.res.end();
     serverState.res = null;
+};
+
+const releaseVideoTaskLock = (token) => {
+    if (!token) return;
+    videoTaskLock.release(token);
+    if (serverState.taskLockToken === token) {
+        serverState.taskLockToken = null;
+    }
 };
 
 const forceCleanFiles = async () => {
@@ -458,6 +501,22 @@ const forceCleanFiles = async () => {
 };
 
 // === 核心处理逻辑 ===
+const isMediaResponse = (response) => {
+    const url = response.url();
+    const contentType = (response.headers()['content-type'] || '').toLowerCase();
+    const resourceType = response.request().resourceType();
+    const pathOnly = url.split('?')[0];
+    return (
+        resourceType === 'media' ||
+        pathOnly.endsWith('.m3u8') ||
+        pathOnly.endsWith('.mp4') ||
+        contentType.includes('application/vnd.apple.mpegurl') ||
+        contentType.includes('mpegurl') ||
+        contentType.includes('video/mp4') ||
+        contentType.includes('media')
+    );
+};
+
 const resolveMediaByBrowser = async (fullUrl, updateStatus) => {
     serverState.currentTask = '浏览器解析';
     updateStatus(null, "🌏 等待浏览器启动");
@@ -485,6 +544,7 @@ const resolveMediaByBrowser = async (fullUrl, updateStatus) => {
 
     let mediaUrl = null;
     let downloadHeaders = null;
+    let pageTitle = '未知标题';
 
     try {
         const UA = DEFAULT_UA;
@@ -508,41 +568,14 @@ const resolveMediaByBrowser = async (fullUrl, updateStatus) => {
 
         const page = await context.newPage();
 
-        // 先挂监听，再 goto（关键）
-        let foundBySniff = false;
-        const findMediaPromise = new Promise((resolve) => {
-            page.on('response', (response) => {
-                if (foundBySniff) return;
-                const url = response.url();
-                const contentType = (response.headers()['content-type'] || '').toLowerCase();
-                const resourceType = response.request().resourceType();
-
-                const mediaResource =
-                    resourceType === 'media' ||
-                    url.split('?')[0].endsWith('.m3u8') ||
-                    url.split('?')[0].endsWith('.mp4') ||
-                    contentType.includes('application/vnd.apple.mpegurl') ||
-                    contentType.includes('mpegurl') ||
-                    contentType.includes('video/mp4') ||
-                    contentType.includes('media');
-
-                if (mediaResource) {
-                    foundBySniff = true;
-                    updateStatus(`🎯 嗅探命中: ${url.substring(0, 50)}...`);
-                    resolve(url);
-                }
-            });
-        });
-
         updateStatus(`🔗 打开页面: ${fullUrl}`);
         await page.goto(fullUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
-
         await page.waitForTimeout(2500);
 
-        const pageTitle = await page.title().catch(() => '未知标题');
+        pageTitle = await page.title().catch(() => '未知标题');
         updateStatus(`📄 页面标题: ${pageTitle}`);
 
-        // 快速 HTML 解析
+        // 1) 先快速 HTML 解析；只有失败后才启动网络嗅探
         updateStatus('尝试直接解析HTML以快速获取链接...');
         let objectString = null;
         try {
@@ -575,18 +608,57 @@ const resolveMediaByBrowser = async (fullUrl, updateStatus) => {
             updateStatus(diagnosticMessage);
         }
 
-        // 如果快速解析没拿到，等嗅探结果
+        // 2) 快速解析失败后，才挂监听并刷新页面以捕获媒体请求
+        //    （首轮未监听，媒体可能已发出，所以必须 reload 再嗅探）
         if (!mediaUrl) {
-            updateStatus('📡 等待网络监听命中媒体资源...');
-            mediaUrl = await Promise.race([
-                findMediaPromise,
-                new Promise((_, reject) => setTimeout(() => reject(new Error('嗅探超时')), 30000))
-            ]);
+            updateStatus('📡 快速命中失败，启动网络嗅探...');
+            let foundBySniff = false;
+            let resolveSniff = null;
+            const findMediaPromise = new Promise((resolve) => {
+                resolveSniff = resolve;
+            });
+            const onResponse = (response) => {
+                if (foundBySniff) return;
+                if (!isMediaResponse(response)) return;
+                foundBySniff = true;
+                const url = response.url();
+                updateStatus(`🎯 嗅探命中: ${url.substring(0, 50)}...`);
+                if (resolveSniff) resolveSniff(url);
+            };
+            page.on('response', onResponse);
+
+            try {
+                await page.reload({ waitUntil: 'domcontentloaded', timeout: 45000 });
+                const reloadedTitle = await page.title().catch(() => pageTitle);
+                if (reloadedTitle) {
+                    pageTitle = reloadedTitle;
+                    updateStatus(`📄 页面标题: ${pageTitle}`);
+                }
+
+                // 轻触播放器，尽量触发媒体请求
+                await page.evaluate(() => {
+                    const video = document.querySelector('video');
+                    if (video) {
+                        try { video.muted = true; video.play().catch(() => {}); } catch (e) {}
+                    }
+                    const playBtn = document.querySelector('.dplayer-play-icon, .vjs-big-play-button, .plyr__control--overlaid, button[aria-label*="播放"], .play');
+                    if (playBtn) {
+                        try { playBtn.click(); } catch (e) {}
+                    }
+                }).catch(() => {});
+
+                mediaUrl = await Promise.race([
+                    findMediaPromise,
+                    new Promise((_, reject) => setTimeout(() => reject(new Error('嗅探超时')), 30000))
+                ]);
+            } finally {
+                page.off('response', onResponse);
+            }
         }
 
         downloadHeaders = await buildDownloadHeaders(context, fullUrl, mediaUrl);
         updateStatus(`🧩 下载指纹已同步: ${downloadHeaders.Cookie ? '含Cookie' : '无Cookie'}`);
-        return { mediaUrl, downloadHeaders, refererUrl: fullUrl };
+        return { mediaUrl, downloadHeaders, refererUrl: fullUrl, pageTitle };
     } finally {
         if (browser) {
             await browser.close().catch(() => {});
@@ -665,6 +737,7 @@ const processTask = async (urlFragment, file = null, code, res, modName = null, 
         let mediaUrl = null;
         let downloadHeaders = null;
         let refererUrl = fullUrl;
+        let pageTitle = null;
 
         // 1) 用户显式指定插件：只走插件，失败不回退浏览器
         if (requestedMod) {
@@ -673,6 +746,7 @@ const processTask = async (urlFragment, file = null, code, res, modName = null, 
                 const resolved = await resolveByMod(requestedMod, urlFragment, updateStatus);
                 mediaUrl = resolved.mediaUrl;
                 refererUrl = resolved.refererUrl || refererUrl;
+                pageTitle = resolved.pageTitle || pageTitle;
                 downloadHeaders = buildBasicHeaders(refererUrl);
             } catch (e) {
                 updateStatus(`❌ 插件 ${requestedMod} 解析失败: ${e.message || e}`);
@@ -687,6 +761,7 @@ const processTask = async (urlFragment, file = null, code, res, modName = null, 
                     const resolved = await resolveByMod('mgnacg', urlFragment, updateStatus);
                     mediaUrl = resolved.mediaUrl;
                     refererUrl = resolved.refererUrl || fullUrl;
+                    pageTitle = resolved.pageTitle || pageTitle;
                     downloadHeaders = buildBasicHeaders(refererUrl);
                 } catch (e) {
                     updateStatus(`⚠️ 插件 mgnacg 解析失败，回退浏览器抓取: ${e.message || e}`);
@@ -701,6 +776,7 @@ const processTask = async (urlFragment, file = null, code, res, modName = null, 
                 mediaUrl = browserResolved.mediaUrl;
                 downloadHeaders = browserResolved.downloadHeaders;
                 refererUrl = browserResolved.refererUrl || fullUrl;
+                pageTitle = browserResolved.pageTitle || pageTitle;
             }
         } else {
             // 3) 其他 http 页面链接：浏览器抓取
@@ -708,6 +784,7 @@ const processTask = async (urlFragment, file = null, code, res, modName = null, 
             mediaUrl = browserResolved.mediaUrl;
             downloadHeaders = browserResolved.downloadHeaders;
             refererUrl = browserResolved.refererUrl || fullUrl;
+            pageTitle = browserResolved.pageTitle || pageTitle;
         }
 
         if (!mediaUrl) {
@@ -757,23 +834,20 @@ const processTask = async (urlFragment, file = null, code, res, modName = null, 
             const totalMB = (total / 1024 / 1024).toFixed(2);
 
             let curr = 0;
-            let lastBytes = 0;
-            let lastT = Date.now();
-            let lastReportT = 0;
+            const downloadSpeed = createSpeedAverager();
+            downloadSpeed.sample(0);
+            const shouldReportDownloadProgress = createProgressLimiter();
             response.data.on('data', (c) => {
                 curr += c.length;
                 const now = Date.now();
-                if (now - lastReportT < PROGRESS_DEBOUNCE_MS) return;
-
-                const elapsed = Math.max(now - lastT, 1);
-                const speed = formatSpeed((curr - lastBytes) * 1000 / elapsed);
-                lastBytes = curr;
-                lastT = now;
-                lastReportT = now;
-
+                downloadSpeed.sample(curr, now);
                 const p = total ? Math.floor((curr / total) * 100) : 0;
+                if (!shouldReportDownloadProgress({ percent: p })) return;
+
+                const speed = downloadSpeed.getSpeed();
+                const speedText = speed > 0 ? ` ${formatSpeed(speed)}` : '';
                 const currMB = (curr / 1024 / 1024).toFixed(2);
-                updateStatus(null, `📥 下载: ${p}% (${currMB}/${totalMB}MB) ${speed}`);
+                updateStatus(null, `📥 下载: ${p}% (${currMB}/${totalMB}MB)${speedText}`);
             });
 
             response.data.pipe(writer);
@@ -799,24 +873,29 @@ const processTask = async (urlFragment, file = null, code, res, modName = null, 
 
             serverState.ffmpegCommand = cmd;
 
-            let lastCompressReportT = 0;
+            const shouldReportCompressProgress = createProgressLimiter();
             cmd.on('progress', (p) => {
-                const now = Date.now();
-                if (now - lastCompressReportT < PROGRESS_DEBOUNCE_MS) return;
-                lastCompressReportT = now;
+                const percent = Math.floor(p.percent || 0);
+                if (!shouldReportCompressProgress({ percent })) return;
                 const outMB = (p.targetSize / 1024).toFixed(2);
-                updateStatus(null, `📦 压缩: ${Math.floor(p.percent || 0)}% (${outMB}MB)`);
+                updateStatus(null, `📦 压缩: ${percent}% (${outMB}MB)`);
             });
             cmd.on('end', resolve);
             cmd.on('error', reject);
         });
 
-        updateStatus("✅ 任务完成\n\n");
+        if (pageTitle) {
+            updateStatus(`✅ 任务完成: ${pageTitle}\n\n`);
+        } else {
+            updateStatus("✅ 任务完成\n\n");
+        }
         if (!res.writableEnded && !res.destroyed) {
-            res.write(JSON.stringify({
+            const payload = {
                 type: "url",
                 url: `https://${res.req.headers.host}/dl/${fileName}`
-            }) + '\n');
+            };
+            if (pageTitle) payload.title = pageTitle;
+            res.write(JSON.stringify(payload) + '\n');
         }
     } catch (error) {
         if (res && !res.writableEnded && !res.destroyed) {
@@ -897,12 +976,14 @@ app.post('/', async (req, res) => {
     // 日志查询
     if (body === 'log' || body.log) {
         const queueStatus = getQueueStatusLine();
+        const lockStatus = getVideoTaskLockStatusLine();
         const logContent = [
             `=== 系统状态 ===`,
             `时间: ${new Date().toLocaleString()}`,
             `状态: ${serverState.isBusy ? '忙碌' : '空闲'}`,
             `任务: ${serverState.currentTask || '无'}`,
             `进度: ${serverState.progressStr || '无'}`,
+            `锁: ${lockStatus || '无'}`,
             `队列: ${queueStatus || '无'}`,
             `\n=== 最近日志 ===`,
             ...logBuffer
@@ -922,8 +1003,15 @@ app.post('/', async (req, res) => {
     // 停止或清理
     if (body === 'rm' || body.rm || body === 'stop' || body.stop) {
         const queueStatus = getQueueStatusLine();
-        const info = serverState.isBusy
-            ? { code: serverState.currentCode, task: serverState.currentTask, queue: queueStatus || undefined }
+        const lockStatus = getVideoTaskLockStatusLine();
+        const activeTaskLock = videoTaskLock.getState();
+        const info = serverState.isBusy || activeTaskLock
+            ? {
+                code: serverState.currentCode || activeTaskLock?.code,
+                task: serverState.currentTask,
+                lock: lockStatus || undefined,
+                queue: queueStatus || undefined
+            }
             : "无任务";
         await killAndReset();
         if (body === 'rm' || body.rm) {
@@ -943,9 +1031,11 @@ app.post('/', async (req, res) => {
             res.write(JSON.stringify({ type: "msg", content: `任务 ${delCode} 已中止` }) + '\n');
         } else if (serverState.isBusy && serverState.currentCode != delCode) {
             const queueStatus = getQueueStatusLine();
+            const lockStatus = getVideoTaskLockStatusLine();
             const extraInfo = [
                 serverState.currentTask ? `任务: ${serverState.currentTask}` : null,
                 serverState.progressStr ? `进度: ${serverState.progressStr}` : null,
+                lockStatus ? `锁: ${lockStatus}` : null,
                 queueStatus ? queueStatus : null
             ].filter(Boolean).join('\n\n');
 
@@ -962,17 +1052,21 @@ app.post('/', async (req, res) => {
 
     // 新建任务
     if (body.url && body.code) {
-        if (serverState.isBusy) {
+        const activeTaskLock = videoTaskLock.getState();
+        if (serverState.isBusy || activeTaskLock) {
             const queueStatus = getQueueStatusLine();
+            const lockStatus = getVideoTaskLockStatusLine();
+            const busyCode = serverState.currentCode || activeTaskLock?.code;
             const extraInfo = [
                 serverState.currentTask ? `任务: ${serverState.currentTask}` : null,
                 serverState.progressStr ? `进度: ${serverState.progressStr}` : null,
+                lockStatus ? `锁: ${lockStatus}` : null,
                 queueStatus ? queueStatus : null
             ].filter(Boolean).join('\n\n');
 
             const errorMsg = extraInfo
-                ? `忙碌中: ${serverState.currentCode}\n\n${extraInfo}`
-                : `忙碌中: ${serverState.currentCode}`;
+                ? `忙碌中: ${busyCode}\n\n${extraInfo}`
+                : `忙碌中: ${busyCode}`;
 
             res.write(JSON.stringify({
                 "type": "error",
@@ -1001,14 +1095,35 @@ app.post('/', async (req, res) => {
             res.end(); return;
         }
 
-        serverState.isBusy = true;
-        serverState.currentCode = Number(body.code);
-        res.setTimeout(0); // 禁用响应超时，避免长任务中断
-        if (taskUrls.length > 1) {
-            processTaskQueue(taskUrls, body.file || null, serverState.currentCode, res, modField);
-        } else {
-            processTask(taskUrls[0], body.file || null, serverState.currentCode, res, modField);
+        const taskCode = Number(body.code);
+        const taskLockToken = videoTaskLock.tryAcquire(taskCode);
+        if (!taskLockToken) {
+            const lockStatus = getVideoTaskLockStatusLine();
+            res.write(JSON.stringify({
+                type: "error",
+                error: lockStatus ? `视频任务锁定中\n\n${lockStatus}` : "视频任务锁定中"
+            }) + '\n');
+            res.end(); return;
         }
+
+        serverState.taskLockToken = taskLockToken;
+        serverState.isBusy = true;
+        serverState.currentCode = taskCode;
+        res.setTimeout(0); // 禁用响应超时，避免长任务中断
+        const runTask = async () => {
+            try {
+                if (taskUrls.length > 1) {
+                    await processTaskQueue(taskUrls, body.file || null, taskCode, res, modField);
+                } else {
+                    await processTask(taskUrls[0], body.file || null, taskCode, res, modField);
+                }
+            } catch (e) {
+                console.error('[Task Runner Error]', e?.stack || e?.message || e);
+            } finally {
+                releaseVideoTaskLock(taskLockToken);
+            }
+        };
+        runTask();
         return;
     }
 

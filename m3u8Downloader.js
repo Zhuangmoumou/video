@@ -2,7 +2,8 @@ const axios = require('axios');
 const fs = require('fs-extra');
 const path = require('path');
 const { URL } = require('url');
-const { exec } = require('child_process');
+const { spawn } = require('child_process');
+const { createProgressLimiter, createSpeedAverager } = require('./progressLimiter');
 
 const proxyDomain = (process.env.PROXY_DOMAIN || '').trim();
 
@@ -76,8 +77,6 @@ function formatAxiosError(error, context = '') {
     return lines.join('\n');
 }
 
-const PROGRESS_DEBOUNCE_MS = 5000;
-
 function formatSpeed(bytesPerSec) {
     if (!Number.isFinite(bytesPerSec) || bytesPerSec <= 0) return '0B/s';
     if (bytesPerSec >= 1024 * 1024) return `${(bytesPerSec / (1024 * 1024)).toFixed(2)}MB/s`;
@@ -138,26 +137,21 @@ async function downloadM3U8(m3u8Url, outputPath, onProgress, serverState, refere
 
         let downloadedCount = 0;
         let totalBytes = 0;
-        let lastBytes = 0;
-        let lastSpeedTime = Date.now();
-        let lastUpdateTime = 0;
+        const downloadSpeed = createSpeedAverager();
+        downloadSpeed.sample(0);
+        const shouldReportProgress = createProgressLimiter();
         const CONCURRENCY = 8; 
         const ffmpegList = [];
 
         const reportProgress = (force = false) => {
             const now = Date.now();
-            if (!force && now - lastUpdateTime < PROGRESS_DEBOUNCE_MS) return;
-
-            const elapsed = Math.max(now - lastSpeedTime, 1);
-            const speed = formatSpeed((totalBytes - lastBytes) * 1000 / elapsed);
-            lastBytes = totalBytes;
-            lastSpeedTime = now;
-            lastUpdateTime = now;
-
             const percent = Math.floor((downloadedCount / totalSegments) * 100);
+            if (!shouldReportProgress({ force, percent })) return;
+
+            const speed = downloadSpeed.getSpeed();
             const currMB = (totalBytes / 1024 / 1024).toFixed(2);
             const segProgress = `${downloadedCount}/${totalSegments}`;
-            onProgress(percent, `${currMB}MB`, segProgress, speed);
+            onProgress(percent, `${currMB}MB`, segProgress, speed > 0 ? formatSpeed(speed) : '');
         };
 
         for (let i = 0; i < tsUrls.length; i += CONCURRENCY) {
@@ -186,6 +180,7 @@ async function downloadM3U8(m3u8Url, outputPath, onProgress, serverState, refere
                 await fs.writeFile(tsPath, response.data);
                 
                 totalBytes += response.data.length;
+                downloadSpeed.sample(totalBytes);
                 downloadedCount++;
                 ffmpegList[realIndex] = `file '${tsFileName}'`;
                 reportProgress(false);
@@ -197,16 +192,31 @@ async function downloadM3U8(m3u8Url, outputPath, onProgress, serverState, refere
         await fs.writeFile(fileListPath, ffmpegList.join('\n'));
         
         const ffmpegPromise = new Promise((resolve, reject) => {
-            const cmd = `ffmpeg -y -f concat -safe 0 -i "list.txt" -c copy -bsf:a aac_adtstoasc "${outputPath}"`;
-            const proc = exec(cmd, { cwd: tempDir }, (err, stdout, stderr) => {
-                if (err) {
-                    err.message += `\n${stderr}`;
-                    reject(err);
-                } else {
-                    resolve();
-                }
+            const proc = spawn('ffmpeg', [
+                '-y',
+                '-f', 'concat',
+                '-safe', '0',
+                '-i', 'list.txt',
+                '-c', 'copy',
+                '-bsf:a', 'aac_adtstoasc',
+                outputPath
+            ], { cwd: tempDir });
+            let stderr = '';
+
+            proc.stderr.on('data', (chunk) => {
+                stderr += chunk.toString();
             });
-            serverState.ffmpegCommand = proc; 
+            proc.on('error', reject);
+            proc.on('close', (code, signal) => {
+                if (code === 0) {
+                    resolve();
+                    return;
+                }
+                const reason = signal ? `signal=${signal}` : `code=${code}`;
+                reject(new Error(`ffmpeg 合并失败 (${reason})\n${stderr}`));
+            });
+
+            serverState.ffmpegCommand = proc;
         });
 
         await ffmpegPromise;
