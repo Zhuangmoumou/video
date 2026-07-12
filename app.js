@@ -83,6 +83,40 @@ const normalizeModResult = (result) => {
     throw new Error(`插件返回了不支持的类型: ${typeof result}`);
 };
 
+const splitTaskUrls = (value) => String(value)
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean);
+
+const isMgnacgUrl = (value) => {
+    if (typeof value !== 'string' || !/^https?:\/\//i.test(value)) return false;
+    try {
+        const host = new URL(value).hostname.toLowerCase();
+        return host === 'mgnacg.com' || host.endsWith('.mgnacg.com');
+    } catch (e) {
+        return false;
+    }
+};
+
+const getQueueFileName = (file, index, total) => {
+    if (!file || total <= 1) return file || null;
+    return `${file}_${index + 1}`;
+};
+
+const shortenText = (value, max = 80) => {
+    const text = String(value || '');
+    return text.length > max ? `${text.slice(0, max - 3)}...` : text;
+};
+
+const getQueueStatusLine = () => {
+    const queue = serverState.queue;
+    if (!queue || !Array.isArray(queue.items) || queue.items.length <= 1) return null;
+    const current = Math.min(queue.currentIndex + 1, queue.items.length);
+    const remaining = Math.max(queue.items.length - current, 0);
+    const currentUrl = queue.items[queue.currentIndex] || '';
+    return `队列: ${current}/${queue.items.length}，剩余 ${remaining}，当前: ${shortenText(currentUrl)}`;
+};
+
 const buildBasicHeaders = (refererUrl) => {
     const headers = {
         'User-Agent': DEFAULT_UA,
@@ -352,12 +386,14 @@ app.get('/mod', (req, res) => {
 
 // GET /log路径，可以直接获取日志
 app.get('/log', (req, res) => {
+    const queueStatus = getQueueStatusLine();
     const logContent = [
         `=== 系统状态 ===`,
         `时间: ${new Date().toLocaleString()}`,
         `状态: ${serverState.isBusy ? '忙碌' : '空闲'}`,
         `任务: ${serverState.currentTask || '无'}`,
         `进度: ${serverState.progressStr || '无'}`,
+        `队列: ${queueStatus || '无'}`,
         `\n=== 最近日志 ===`,
         ...logBuffer
     ].join('\n');
@@ -372,6 +408,7 @@ let serverState = {
     currentCode: null,
     currentTask: null,
     progressStr: null,
+    queue: null,
     abortController: null,
     ffmpegCommand: null,
     browser: null,
@@ -379,22 +416,27 @@ let serverState = {
 };
 
 // === 辅助函数 ===
-const killAndReset = async () => {
-    console.log('[System] 🗑 正在释放资源锁...');
+const releaseCurrentTaskResources = async () => {
     if (serverState.browser) { try { await serverState.browser.close(); } catch (e) {} }
     if (serverState.abortController) { try { serverState.abortController.abort(); } catch (e) {} }
-    if (serverState.ffmpegCommand) { 
-        try { if (typeof serverState.ffmpegCommand.kill === 'function') serverState.ffmpegCommand.kill('SIGKILL'); } catch (e) {} 
+    if (serverState.ffmpegCommand) {
+        try { if (typeof serverState.ffmpegCommand.kill === 'function') serverState.ffmpegCommand.kill('SIGKILL'); } catch (e) {}
     }
     logBuffer = logBuffer.filter(line => !line.includes('⏳进度:'));
-    serverState.isBusy = false;
-    serverState.currentCode = null;
     serverState.currentTask = null;
     serverState.progressStr = null;
     serverState.abortController = null;
     serverState.ffmpegCommand = null;
     serverState.browser = null;
-    if (serverState.res && !serverState.res.writableEnded) serverState.res.end();
+};
+
+const killAndReset = async () => {
+    console.log('[System] 🗑 正在释放资源锁...');
+    await releaseCurrentTaskResources();
+    serverState.isBusy = false;
+    serverState.currentCode = null;
+    serverState.queue = null;
+    if (serverState.res && !serverState.res.writableEnded && !serverState.res.destroyed) serverState.res.end();
     serverState.res = null;
 };
 
@@ -553,11 +595,14 @@ const resolveMediaByBrowser = async (fullUrl, updateStatus) => {
     }
 };
 
-const processTask = async (urlFragment, file = null, code, res, modName = null) => {
+const processTask = async (urlFragment, file = null, code, res, modName = null, options = {}) => {
     const isHttpUrl = typeof urlFragment === 'string' && /^https?:\/\//i.test(urlFragment);
     const requestedMod = modName ? sanitizeModName(modName) : null;
+    const useDefaultMgnacg = !requestedMod && (!isHttpUrl || isMgnacgUrl(urlFragment));
+    const queueMode = Boolean(options.queueMode);
+    const queueLabel = options.total > 1 ? ` [${options.index + 1}/${options.total}]` : '';
 
-    // 默认 mgnacg 编号路径 / 显式插件 / 直接打开页面
+    // 默认 mgnacg 编号路径 / mgnacg 完整 URL / 显式插件 / 直接打开页面
     let fullUrl;
     if (isHttpUrl) {
         fullUrl = urlFragment;
@@ -588,7 +633,7 @@ const processTask = async (urlFragment, file = null, code, res, modName = null) 
     const downloadPath = path.join(ROOT_DIR, fileName);
     const outPath = path.join(OUT_DIR, fileName);
     serverState.res = res;
-    res.on('close', () => {
+    if (options.attachResponseClose !== false) res.on('close', () => {
         if (serverState.res === res) {
             console.log(`[T ${code}] 客户端连接已断开，任务继续执行`);
             serverState.res = null; // 客户端断开后不再写入
@@ -612,7 +657,7 @@ const processTask = async (urlFragment, file = null, code, res, modName = null) 
     };
 
     try {
-        updateStatus(`🚀 任务开始 (${code})`);
+        updateStatus(`🚀 任务开始 (${code})${queueLabel}: ${urlFragment}`);
         if (requestedMod) {
             updateStatus(`🔌 任务指定插件: ${requestedMod}`);
         }
@@ -633,12 +678,12 @@ const processTask = async (urlFragment, file = null, code, res, modName = null) 
                 updateStatus(`❌ 插件 ${requestedMod} 解析失败: ${e.message || e}`);
                 throw e;
             }
-        } else if (!isHttpUrl) {
-            // 2) 默认编号任务：优先 mgnacg 插件，失败再浏览器
+        } else if (useDefaultMgnacg) {
+            // 2) 默认 mgnacg 任务：编号或 mgnacg.com URL 都优先插件，失败再浏览器
             serverState.currentTask = '插件:mgnacg';
             if (mods.has('mgnacg')) {
                 try {
-                    updateStatus('🔌 默认任务优先使用插件 mgnacg 快速解析');
+                    updateStatus('🔌 mgnacg 任务优先使用插件快速解析');
                     const resolved = await resolveByMod('mgnacg', urlFragment, updateStatus);
                     mediaUrl = resolved.mediaUrl;
                     refererUrl = resolved.refererUrl || fullUrl;
@@ -658,7 +703,7 @@ const processTask = async (urlFragment, file = null, code, res, modName = null) 
                 refererUrl = browserResolved.refererUrl || fullUrl;
             }
         } else {
-            // 3) 直接传入 http 页面链接：浏览器抓取
+            // 3) 其他 http 页面链接：浏览器抓取
             const browserResolved = await resolveMediaByBrowser(fullUrl, updateStatus);
             mediaUrl = browserResolved.mediaUrl;
             downloadHeaders = browserResolved.downloadHeaders;
@@ -675,7 +720,7 @@ const processTask = async (urlFragment, file = null, code, res, modName = null) 
 
         const headers = downloadHeaders || buildBasicHeaders(refererUrl);
 
-                const isM3U8 = mediaUrl.includes('.m3u8');
+        const isM3U8 = mediaUrl.includes('.m3u8');
         serverState.currentTask = isM3U8 ? 'M3U8下载' : 'MP4下载';
         serverState.abortController = new AbortController();
 
@@ -767,19 +812,74 @@ const processTask = async (urlFragment, file = null, code, res, modName = null) 
         });
 
         updateStatus("✅ 任务完成\n\n");
-        if (!res.writableEnded) {
+        if (!res.writableEnded && !res.destroyed) {
             res.write(JSON.stringify({
                 type: "url",
                 url: `https://${res.req.headers.host}/dl/${fileName}`
             }) + '\n');
         }
     } catch (error) {
-        if (res && !res.writableEnded) {
+        if (res && !res.writableEnded && !res.destroyed) {
             res.write(JSON.stringify({ type: "error", error: error.toString() }) + '\n');
         }
         console.error('[Task Error]', error?.stack || error?.message || error);
+        return false;
     } finally {
-        await killAndReset();
+        if (queueMode) {
+            await releaseCurrentTaskResources();
+        } else {
+            await killAndReset();
+        }
+    }
+    return true;
+};
+
+const processTaskQueue = async (urls, file = null, code, res, modName = null) => {
+    const total = urls.length;
+    serverState.queue = { items: urls, currentIndex: 0 };
+    serverState.res = res;
+    res.on('close', () => {
+        if (serverState.res === res) {
+            console.log(`[T ${code}] 客户端连接已断开，队列继续执行`);
+            serverState.res = null;
+        }
+    });
+
+    const writeQueueMessage = (content) => {
+        console.log(`[T ${code}] ${content}`);
+        if (serverState.res && !serverState.res.writableEnded && !serverState.res.destroyed) {
+            serverState.res.write(JSON.stringify({ type: "msg", content }) + '\n');
+        }
+    };
+
+    writeQueueMessage(`📋 队列已创建: ${total} 个任务\n${urls.map((url, i) => `${i + 1}. ${url}`).join('\n')}`);
+
+    try {
+        for (let i = 0; i < total; i++) {
+            if (!serverState.isBusy || serverState.currentCode !== code) break;
+
+            serverState.queue.currentIndex = i;
+            serverState.currentTask = `队列 ${i + 1}/${total}`;
+            serverState.progressStr = `等待执行: ${shortenText(urls[i])}`;
+            writeQueueMessage(`📋 队列进度 ${i + 1}/${total}，开始执行: ${urls[i]}`);
+
+            await processTask(
+                urls[i],
+                getQueueFileName(file, i, total),
+                code,
+                res,
+                modName,
+                { queueMode: true, index: i, total, attachResponseClose: false }
+            );
+        }
+
+        if (serverState.isBusy && serverState.currentCode === code) {
+            writeQueueMessage(`✅ 队列完成: ${total} 个任务已处理`);
+        }
+    } finally {
+        if (serverState.currentCode === code) {
+            await killAndReset();
+        }
     }
 };
 
@@ -796,7 +896,17 @@ app.post('/', async (req, res) => {
     
     // 日志查询
     if (body === 'log' || body.log) {
-        const logContent = [`=== 系统状态 ===`, `时间: ${new Date().toLocaleString()}`, `状态: ${serverState.isBusy ? '忙碌' : '空闲'}`, `\n=== 最近日志 ===`, ...logBuffer].join('\n');
+        const queueStatus = getQueueStatusLine();
+        const logContent = [
+            `=== 系统状态 ===`,
+            `时间: ${new Date().toLocaleString()}`,
+            `状态: ${serverState.isBusy ? '忙碌' : '空闲'}`,
+            `任务: ${serverState.currentTask || '无'}`,
+            `进度: ${serverState.progressStr || '无'}`,
+            `队列: ${queueStatus || '无'}`,
+            `\n=== 最近日志 ===`,
+            ...logBuffer
+        ].join('\n');
         await fs.writeFile(path.join(OUT_DIR, 'log.txt'), logContent);
         res.write(JSON.stringify({ "type": "log", "log": `https://${req.headers.host}/dl/log.txt` }) + '\n');
         res.end(); return;
@@ -811,7 +921,10 @@ app.post('/', async (req, res) => {
 
     // 停止或清理
     if (body === 'rm' || body.rm || body === 'stop' || body.stop) {
-        const info = serverState.isBusy ? { code: serverState.currentCode, task: serverState.currentTask } : "无任务";
+        const queueStatus = getQueueStatusLine();
+        const info = serverState.isBusy
+            ? { code: serverState.currentCode, task: serverState.currentTask, queue: queueStatus || undefined }
+            : "无任务";
         await killAndReset();
         if (body === 'rm' || body.rm) {
             const deleted = await forceCleanFiles();
@@ -829,9 +942,11 @@ app.post('/', async (req, res) => {
             await killAndReset();
             res.write(JSON.stringify({ type: "msg", content: `任务 ${delCode} 已中止` }) + '\n');
         } else if (serverState.isBusy && serverState.currentCode != delCode) {
+            const queueStatus = getQueueStatusLine();
             const extraInfo = [
                 serverState.currentTask ? `任务: ${serverState.currentTask}` : null,
-                serverState.progressStr ? `进度: ${serverState.progressStr}` : null
+                serverState.progressStr ? `进度: ${serverState.progressStr}` : null,
+                queueStatus ? queueStatus : null
             ].filter(Boolean).join('\n\n');
 
             const errorMsg = extraInfo
@@ -848,9 +963,11 @@ app.post('/', async (req, res) => {
     // 新建任务
     if (body.url && body.code) {
         if (serverState.isBusy) {
+            const queueStatus = getQueueStatusLine();
             const extraInfo = [
                 serverState.currentTask ? `任务: ${serverState.currentTask}` : null,
-                serverState.progressStr ? `进度: ${serverState.progressStr}` : null
+                serverState.progressStr ? `进度: ${serverState.progressStr}` : null,
+                queueStatus ? queueStatus : null
             ].filter(Boolean).join('\n\n');
 
             const errorMsg = extraInfo
@@ -861,6 +978,11 @@ app.post('/', async (req, res) => {
                 "type": "error",
                 "error": errorMsg
             }) + '\n');
+            res.end(); return;
+        }
+        const taskUrls = splitTaskUrls(body.url);
+        if (!taskUrls.length) {
+            res.write(JSON.stringify({ type: "error", error: "url 字段不能为空" }) + '\n');
             res.end(); return;
         }
         // 可选 mod：插件文件名（不含 .js）；指定后 url 会原样传给插件 download()
@@ -882,7 +1004,11 @@ app.post('/', async (req, res) => {
         serverState.isBusy = true;
         serverState.currentCode = Number(body.code);
         res.setTimeout(0); // 禁用响应超时，避免长任务中断
-        processTask(body.url, body.file || null, serverState.currentCode, res, modField);
+        if (taskUrls.length > 1) {
+            processTaskQueue(taskUrls, body.file || null, serverState.currentCode, res, modField);
+        } else {
+            processTask(taskUrls[0], body.file || null, serverState.currentCode, res, modField);
+        }
         return;
     }
 
