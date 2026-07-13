@@ -447,36 +447,33 @@ const formatCutRange = (range) => {
     return `${toClock(range.start)}-${toClock(range.end)}`;
 };
 
-const buildCutFilter = (cutRanges) => {
-    let cursor = 0;
-    const keepRanges = [];
-    for (const range of cutRanges) {
-        if (range.start > cursor) {
-            keepRanges.push({ start: cursor, end: range.start });
-        }
-        cursor = Math.max(cursor, range.end);
-    }
-    keepRanges.push({ start: cursor, end: null });
-
-    const filters = [];
-    keepRanges.forEach((range, index) => {
+const buildCutDropExpression = (cutRanges) => {
+    const ranges = cutRanges.map((range) => {
         const start = formatCutSecond(range.start);
-        const end = range.end == null ? '' : `:end=${formatCutSecond(range.end)}`;
-        filters.push(`[0:v]trim=start=${start}${end},setpts=PTS-STARTPTS[v${index}]`);
-        filters.push(`[0:a]atrim=start=${start}${end},asetpts=PTS-STARTPTS[a${index}]`);
+        const end = formatCutSecond(range.end);
+        return `gte(t,${start})*lt(t,${end})`;
     });
+    return `not(${ranges.join('+')})`;
+};
 
-    if (keepRanges.length === 1) {
-        filters.push(`[v0]${SCALE_FILTER}[vout]`);
-        filters.push('[a0]anull[aout]');
-        return filters.join(';');
-    }
+const buildCutPtsExpression = (cutRanges) => {
+    let removed = 0;
+    return cutRanges.reduce((expr, range) => {
+        removed += range.end - range.start;
+        return `${expr}-(${formatCutSecond(removed)}/TB)*gte(T,${formatCutSecond(range.end)})`;
+    }, 'PTS-STARTPTS');
+};
 
-    const concatInputs = keepRanges.map((_, index) => `[v${index}][a${index}]`).join('');
-    filters.push(`${concatInputs}concat=n=${keepRanges.length}:v=1:a=1[vcut][acut]`);
-    filters.push(`[vcut]${SCALE_FILTER}[vout]`);
-    filters.push('[acut]anull[aout]');
-    return filters.join(';');
+const buildCutVideoFilter = (cutRanges) => {
+    const dropExpr = buildCutDropExpression(cutRanges);
+    const ptsExpr = buildCutPtsExpression(cutRanges);
+    return `select='${dropExpr}',setpts='${ptsExpr}',${SCALE_FILTER}`;
+};
+
+const buildCutAudioFilter = (cutRanges) => {
+    const dropExpr = buildCutDropExpression(cutRanges);
+    const ptsExpr = buildCutPtsExpression(cutRanges);
+    return `aselect='${dropExpr}',asetpts='${ptsExpr}'`;
 };
 
 const buildCompressOutputOptions = (cutRanges) => {
@@ -491,9 +488,8 @@ const buildCompressOutputOptions = (cutRanges) => {
     }
 
     return [
-        '-filter_complex', buildCutFilter(cutRanges),
-        '-map', '[vout]',
-        '-map', '[aout]',
+        '-vf', buildCutVideoFilter(cutRanges),
+        '-af', buildCutAudioFilter(cutRanges),
         '-c:v', 'libx264',
         '-crf', '17',
         '-preset', 'medium',
@@ -1005,8 +1001,15 @@ const processTask = async (urlFragment, file = null, code, res, modName = null, 
                 const outMB = (p.targetSize / 1024).toFixed(2);
                 updateStatus(null, `📦 压缩: ${percent}% (${outMB}MB)`);
             });
-            cmd.on('end', resolve);
-            cmd.on('error', reject);
+            cmd.on('start', (commandLine) => console.log(`[FFmpeg] ${commandLine}`));
+            cmd.on('end', () => {
+                if (serverState.ffmpegCommand === cmd) serverState.ffmpegCommand = null;
+                resolve();
+            });
+            cmd.on('error', (error) => {
+                if (serverState.ffmpegCommand === cmd) serverState.ffmpegCommand = null;
+                reject(error);
+            });
         });
 
         if (pageTitle) {

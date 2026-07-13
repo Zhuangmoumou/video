@@ -208,6 +208,7 @@ async function downloadM3U8(m3u8Url, outputPath, onProgress, serverState, refere
             });
             proc.on('error', reject);
             proc.on('close', (code, signal) => {
+                if (serverState.ffmpegCommand === proc) serverState.ffmpegCommand = null;
                 if (code === 0) {
                     resolve();
                     return;
