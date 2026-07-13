@@ -67,19 +67,70 @@ const getMod = (name) => {
     return mod;
 };
 
+const parseTimeToSeconds = (value) => {
+    if (typeof value === 'number' && Number.isFinite(value)) return value;
+    const text = String(value ?? '').trim();
+    if (!text) return NaN;
+    if (/^\d+(?:\.\d+)?$/.test(text)) return Number(text);
+    const parts = text.split(':').map(Number);
+    if (parts.length < 2 || parts.length > 3 || parts.some((n) => !Number.isFinite(n))) return NaN;
+    return parts.reduce((total, part) => total * 60 + part, 0);
+};
+
+const normalizeCutRanges = (value) => {
+    if (!value) return [];
+    const isPair = Array.isArray(value)
+        && value.length === 2
+        && (typeof value[0] !== 'object' || value[0] == null)
+        && (typeof value[1] !== 'object' || value[1] == null);
+    const items = Array.isArray(value) && !isPair ? value : [value];
+    const ranges = [];
+
+    for (const item of items) {
+        let start;
+        let end;
+        if (Array.isArray(item)) {
+            [start, end] = item;
+        } else if (item && typeof item === 'object') {
+            start = item.start ?? item.from;
+            end = item.end ?? item.to;
+        } else {
+            continue;
+        }
+
+        const s = parseTimeToSeconds(start);
+        const e = parseTimeToSeconds(end);
+        if (!Number.isFinite(s) || !Number.isFinite(e) || s < 0 || e <= s) continue;
+        ranges.push({ start: s, end: e });
+    }
+
+    ranges.sort((a, b) => a.start - b.start);
+    const merged = [];
+    for (const range of ranges) {
+        const prev = merged[merged.length - 1];
+        if (prev && range.start <= prev.end) {
+            prev.end = Math.max(prev.end, range.end);
+        } else {
+            merged.push({ ...range });
+        }
+    }
+    return merged;
+};
+
 const normalizeModResult = (result) => {
     if (result == null) throw new Error('插件返回空结果');
     if (typeof result === 'string') {
         const url = result.trim();
         if (!url) throw new Error('插件返回空 URL');
-        return { mediaUrl: url, refererUrl: null, pageTitle: null, meta: null };
+        return { mediaUrl: url, refererUrl: null, pageTitle: null, cutRanges: [], meta: null };
     }
     if (typeof result === 'object') {
         const mediaUrl = (result.url || result.mediaUrl || '').toString().trim();
         if (!mediaUrl) throw new Error('插件返回对象中缺少 url/mediaUrl');
         const refererUrl = result.pageUrl || result.referer || result.refererUrl || null;
         const pageTitle = (result.pageTitle || result.title || result.vod_name || '').toString().trim() || null;
-        return { mediaUrl, refererUrl, pageTitle, meta: result };
+        const cutRanges = normalizeCutRanges(result.cutRanges || result.ffmpegCutRanges || result.cuts || result.cut);
+        return { mediaUrl, refererUrl, pageTitle, cutRanges, meta: result };
     }
     throw new Error(`插件返回了不支持的类型: ${typeof result}`);
 };
@@ -375,6 +426,80 @@ const buildDownloadHeaders = async (context, refererUrl, mediaUrl) => {
     };
     if (cookieHeader) headers.Cookie = cookieHeader;
     return headers;
+};
+
+const SCALE_FILTER = 'scale=320:170:force_original_aspect_ratio=decrease,pad=320:170:(ow-iw)/2:(oh-ih)/2';
+
+const formatCutSecond = (value) => Number(value.toFixed(3)).toString();
+
+const formatCutRange = (range) => {
+    const toClock = (seconds) => {
+        const total = Math.floor(seconds);
+        const h = Math.floor(total / 3600);
+        const m = Math.floor((total % 3600) / 60);
+        const s = total % 60;
+        const body = h > 0
+            ? `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
+            : `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+        const ms = seconds - total;
+        return ms > 0 ? `${body}.${String(Math.round(ms * 1000)).padStart(3, '0')}` : body;
+    };
+    return `${toClock(range.start)}-${toClock(range.end)}`;
+};
+
+const buildCutFilter = (cutRanges) => {
+    let cursor = 0;
+    const keepRanges = [];
+    for (const range of cutRanges) {
+        if (range.start > cursor) {
+            keepRanges.push({ start: cursor, end: range.start });
+        }
+        cursor = Math.max(cursor, range.end);
+    }
+    keepRanges.push({ start: cursor, end: null });
+
+    const filters = [];
+    keepRanges.forEach((range, index) => {
+        const start = formatCutSecond(range.start);
+        const end = range.end == null ? '' : `:end=${formatCutSecond(range.end)}`;
+        filters.push(`[0:v]trim=start=${start}${end},setpts=PTS-STARTPTS[v${index}]`);
+        filters.push(`[0:a]atrim=start=${start}${end},asetpts=PTS-STARTPTS[a${index}]`);
+    });
+
+    if (keepRanges.length === 1) {
+        filters.push(`[v0]${SCALE_FILTER}[vout]`);
+        filters.push('[a0]anull[aout]');
+        return filters.join(';');
+    }
+
+    const concatInputs = keepRanges.map((_, index) => `[v${index}][a${index}]`).join('');
+    filters.push(`${concatInputs}concat=n=${keepRanges.length}:v=1:a=1[vcut][acut]`);
+    filters.push(`[vcut]${SCALE_FILTER}[vout]`);
+    filters.push('[acut]anull[aout]');
+    return filters.join(';');
+};
+
+const buildCompressOutputOptions = (cutRanges) => {
+    if (!cutRanges.length) {
+        return [
+            '-vf', SCALE_FILTER,
+            '-c:v', 'libx264',
+            '-crf', '17',
+            '-preset', 'medium',
+            '-c:a', 'copy'
+        ];
+    }
+
+    return [
+        '-filter_complex', buildCutFilter(cutRanges),
+        '-map', '[vout]',
+        '-map', '[aout]',
+        '-c:v', 'libx264',
+        '-crf', '17',
+        '-preset', 'medium',
+        '-c:a', 'aac',
+        '-b:a', '192k'
+    ];
 };
 
 // === 全局异常保护 ===
@@ -738,6 +863,7 @@ const processTask = async (urlFragment, file = null, code, res, modName = null, 
         let downloadHeaders = null;
         let refererUrl = fullUrl;
         let pageTitle = null;
+        let cutRanges = [];
 
         // 1) 用户显式指定插件：只走插件，失败不回退浏览器
         if (requestedMod) {
@@ -747,6 +873,7 @@ const processTask = async (urlFragment, file = null, code, res, modName = null, 
                 mediaUrl = resolved.mediaUrl;
                 refererUrl = resolved.refererUrl || refererUrl;
                 pageTitle = resolved.pageTitle || pageTitle;
+                cutRanges = resolved.cutRanges || [];
                 downloadHeaders = buildBasicHeaders(refererUrl);
             } catch (e) {
                 updateStatus(`❌ 插件 ${requestedMod} 解析失败: ${e.message || e}`);
@@ -762,6 +889,7 @@ const processTask = async (urlFragment, file = null, code, res, modName = null, 
                     mediaUrl = resolved.mediaUrl;
                     refererUrl = resolved.refererUrl || fullUrl;
                     pageTitle = resolved.pageTitle || pageTitle;
+                    cutRanges = resolved.cutRanges || [];
                     downloadHeaders = buildBasicHeaders(refererUrl);
                 } catch (e) {
                     updateStatus(`⚠️ 插件 mgnacg 解析失败，回退浏览器抓取: ${e.message || e}`);
@@ -797,7 +925,7 @@ const processTask = async (urlFragment, file = null, code, res, modName = null, 
 
         const headers = downloadHeaders || buildBasicHeaders(refererUrl);
 
-        const isM3U8 = mediaUrl.includes('.m3u8');
+        const isM3U8 = mediaUrl.toLowerCase().includes('.m3u8');
         serverState.currentTask = isM3U8 ? 'M3U8下载' : 'MP4下载';
         serverState.abortController = new AbortController();
 
@@ -815,7 +943,7 @@ const processTask = async (urlFragment, file = null, code, res, modName = null, 
                     updateStatus(null, `📥 下载: ${p}% (${s}) [分片:${seg}]${speedText}`);
                 },
                 serverState,
-                fullUrl,
+                refererUrl || fullUrl,
                 headers
             );
         } else {
@@ -858,17 +986,14 @@ const processTask = async (urlFragment, file = null, code, res, modName = null, 
         }
 
         serverState.currentTask = 'FFmpeg压缩';
+        if (cutRanges.length) {
+            updateStatus(`✂️ 压缩时删除片段: ${cutRanges.map(formatCutRange).join(', ')}`);
+        }
         updateStatus(null, `📦 压缩中...`);
 
         await new Promise((resolve, reject) => {
             const cmd = ffmpeg(downloadPath)
-                .outputOptions([
-                    '-vf', 'scale=320:170:force_original_aspect_ratio=decrease,pad=320:170:(ow-iw)/2:(oh-ih)/2',
-                    '-c:v', 'libx264',
-                    '-crf', '17',
-                    '-preset', 'medium',
-                    '-c:a', 'copy'
-                ])
+                .outputOptions(buildCompressOutputOptions(cutRanges))
                 .save(outPath);
 
             serverState.ffmpegCommand = cmd;

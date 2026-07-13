@@ -72,6 +72,7 @@ return 'https://cdn.example.com/index.m3u8';
 return {
   url: 'https://cdn.example.com/a.mp4', // 必填（也可用 mediaUrl）
   pageUrl: 'https://site.example/play/1', // 可选，用作下载 Referer
+  cutRanges: [{ start: 364, end: 384 }], // 可选，压缩时删除的片段，单位秒
   // referer / refererUrl 同样可被识别为 Referer
 };
 ```
@@ -80,6 +81,7 @@ return {
 |------|------|------|
 | `url` 或 `mediaUrl` | 是 | 最终可下载的媒体地址（mp4 / m3u8 等） |
 | `pageUrl` / `referer` / `refererUrl` | 否 | 下载时的 Referer/Origin 来源页 |
+| `cutRanges` | 否 | 压缩时删除的片段数组，如 `[{ "start": 364, "end": 384 }]`；也支持 `MM:SS` / `HH:MM:SS` 字符串 |
 
 其它字段可自行附加（便于调试），主程序会保留在内部 meta 中，但不保证对外暴露。
 
@@ -162,6 +164,9 @@ return {
 
 // 队列：按顺序逐个处理，仍然不会并发执行
 { "url": "1619-3-2,1619-3-3,1619-3-4", "code": 1 }
+
+// 指定 danzhu 插件，可传完整 URL 或编号
+{ "url": "6477-1-1", "code": 1, "mod": "danzhu" }
 ```
 
 ---
@@ -173,9 +178,9 @@ return {
 3. 判断是否 m3u8：
    - 含 `.m3u8` → M3U8 分片下载
    - 否则 → MP4 流式下载（支持手动跟随 302；跨站会剥离 Referer/Origin/Cookie）
-4. FFmpeg 压缩到 `mp4/out/`
+4. FFmpeg 压缩到 `mp4/out/`；若插件返回 `cutRanges`，在压缩阶段删除对应片段
 
-插件 **只负责解析出可下载地址**，不负责落盘、转码、进度上报。
+插件 **只负责解析出可下载地址**，可选提供剪辑参数；不负责落盘、转码、进度上报。
 
 ---
 
@@ -246,6 +251,11 @@ curl -N -H 'Content-Type: application/json' \
 curl -N -H 'Content-Type: application/json' \
   -d '{"url":"1619-3-2","code":1,"mod":"mgnacg"}' \
   http://127.0.0.1:9898/
+
+# 指定 danzhu 插件，可传完整 URL 或编号
+curl -N -H 'Content-Type: application/json' \
+  -d '{"url":"6477-1-1","code":1,"mod":"danzhu"}' \
+  http://127.0.0.1:9898/
 ```
 
 任务日志中与插件相关的标识：
@@ -262,5 +272,6 @@ curl -N -H 'Content-Type: application/json' \
 | 插件 | 文件 | 说明 |
 |------|------|------|
 | `mgnacg` | `mod/mgnacg.js` | 解析 mgnacg 选集编号为媒体直链；默认编号任务会优先调用 |
+| `danzhu` | `mod/danzhu.js` | 解析 dm.danzhuacg.com 播放页/编号为 m3u8，并返回 `cutRanges` 让压缩阶段删除 06:04-06:24 |
 
 参考实现与线路说明见 `mgnacg.js` 文件头注释。
