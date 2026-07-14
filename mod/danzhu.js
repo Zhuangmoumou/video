@@ -13,7 +13,7 @@ const axios = require('axios');
 
 const SITE = 'https://dm.danzhuacg.com';
 const HOST = 'dm.danzhuacg.com';
-const AD_START_SECONDS = 6 * 60 + 4;
+const AD_START_SECONDS = 6 * 60 + 3.8;
 const AD_END_SECONDS = 6 * 60 + 24;
 const DEFAULT_UA =
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
