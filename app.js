@@ -141,6 +141,13 @@ const splitTaskUrls = (value) => String(value)
     .map((item) => item.trim())
     .filter(Boolean);
 
+const splitTaskFiles = (value) => {
+    if (value == null || value === '') return [];
+    return String(value)
+        .split(',')
+        .map((item) => item.trim());
+};
+
 const isMgnacgUrl = (value) => {
     if (typeof value !== 'string' || !/^https?:\/\//i.test(value)) return false;
     try {
@@ -151,7 +158,15 @@ const isMgnacgUrl = (value) => {
     }
 };
 
-const getQueueFileName = (file, index, total) => {
+const getQueueFileName = (files, index, total) => {
+    const names = Array.isArray(files) ? files : splitTaskFiles(files);
+    if (!names.length) return null;
+
+    if (names.length > 1) {
+        return names[index] || null;
+    }
+
+    const file = names[0];
     if (!file || total <= 1) return file || null;
     return `${file}_${index + 1}`;
 };
@@ -1324,6 +1339,7 @@ app.post('/', async (req, res) => {
             res.write(JSON.stringify({ type: "error", error: "url 字段不能为空" }) + '\n');
             res.end(); return;
         }
+        const taskFiles = splitTaskFiles(body.file);
         // 可选 mod：插件文件名（不含 .js）；指定后 url 会原样传给插件 download()
         let modField = null;
         try {
@@ -1358,9 +1374,9 @@ app.post('/', async (req, res) => {
         const runTask = async () => {
             try {
                 if (taskUrls.length > 1) {
-                    await processTaskQueue(taskUrls, body.file || null, taskCode, res, modField);
+                    await processTaskQueue(taskUrls, taskFiles, taskCode, res, modField);
                 } else {
-                    await processTask(taskUrls[0], body.file || null, taskCode, res, modField);
+                    await processTask(taskUrls[0], taskFiles[0] || null, taskCode, res, modField);
                 }
             } catch (e) {
                 console.error('[Task Runner Error]', e?.stack || e?.message || e);

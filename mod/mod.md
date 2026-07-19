@@ -129,6 +129,7 @@ return {
 
 - 默认编号任务依赖名为 **`mgnacg`** 的插件；没有该插件时直接浏览器。
 - `url` 字段可以用英文逗号分割多个任务；服务端仍然只会同时执行一个任务，并按传入顺序串行处理队列。
+- `file` 字段也可以用英文逗号分割多个输出文件名，并按顺序对应队列任务；队列只传单个 `file` 时仍会自动追加 `_1`、`_2` 后缀。
 - 无 `mod` 时，域名匹配 `mgnacg.com` 的完整 URL 也会先走 `mgnacg` 插件，失败后回退浏览器。
 - 用户指定 `mod` 时，`url` 可能不是网页链接，因此 **禁止** 再回退浏览器。
 
@@ -165,8 +166,14 @@ return {
 // 队列：按顺序逐个处理，仍然不会并发执行
 { "url": "1619-3-2,1619-3-3,1619-3-4", "code": 1 }
 
+// 队列：文件名按逗号顺序对应每个任务
+{ "url": "1619-3-2,1619-3-3,1619-3-4", "file": "ep2,ep3,ep4", "code": 1 }
+
 // 指定 danzhu 插件，可传完整 URL 或编号
 { "url": "6477-1-1", "code": 1, "mod": "danzhu" }
+
+// 指定 sorani 插件（青空次元，返回 m3u8）
+{ "url": "https://www.sorani.net/anime/mal/4634/episode/01", "code": 1, "mod": "sorani" }
 ```
 
 ---
@@ -273,5 +280,6 @@ curl -N -H 'Content-Type: application/json' \
 |------|------|------|
 | `mgnacg` | `mod/mgnacg.js` | 解析 mgnacg 选集编号为媒体直链；默认编号任务会优先调用 |
 | `danzhu` | `mod/danzhu.js` | 解析 dm.danzhuacg.com 播放页/编号为 m3u8，并返回 `cutRanges` 让压缩阶段删除 06:04-06:24 |
+| `sorani` | `mod/sorani.js` | 解析 www.sorani.net 番剧编号/URL 为 AES-128 m3u8 直链（需带站点 Referer） |
 
 参考实现与线路说明见 `mgnacg.js` 文件头注释。
