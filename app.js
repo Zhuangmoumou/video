@@ -1836,8 +1836,24 @@ const processTask = async (urlFragment, file = null, code, res, modName = null, 
             throw new Error("无法通过任何方式找到有效的视频链接。");
         }
 
-        if (!/^https?:\/\//i.test(mediaUrl)) {
-            throw new Error(`解析结果不是 http(s) 链接: ${String(mediaUrl).slice(0, 120)}`);
+        // 插件可返回本地改写后的 m3u8（绝对路径，如 /tmp/danzhu_xxx.m3u8）；其余仍要求 http(s)
+        const isLocalM3u8 = (() => {
+            const text = String(mediaUrl || '').trim();
+            if (!text || /^https?:\/\//i.test(text)) return false;
+            if (!path.isAbsolute(text)) return false;
+            if (!text.toLowerCase().includes('.m3u8')) return false;
+            return true;
+        })();
+
+        if (!/^https?:\/\//i.test(mediaUrl) && !isLocalM3u8) {
+            throw new Error(`解析结果不是 http(s) 链接或本地 m3u8: ${String(mediaUrl).slice(0, 120)}`);
+        }
+
+        if (isLocalM3u8) {
+            if (!await fs.pathExists(mediaUrl)) {
+                throw new Error(`本地 m3u8 不存在: ${mediaUrl}`);
+            }
+            updateStatus(`📄 使用本地 m3u8: ${mediaUrl}`);
         }
 
         const headers = downloadHeaders || buildBasicHeaders(refererUrl);

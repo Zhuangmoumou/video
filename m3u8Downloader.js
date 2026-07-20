@@ -35,10 +35,22 @@ function getAxiosProxyConfig() {
     return cfg;
 }
 
+function isLocalMediaPath(url) {
+    if (typeof url !== 'string') return false;
+    const text = url.trim();
+    if (!text || /^https?:\/\//i.test(text) || text.startsWith('//')) return false;
+    // 插件可返回本地改写后的 m3u8（如 /tmp/danzhu_xxx.m3u8）
+    return path.isAbsolute(text);
+}
+
 function applyProxy(originalUrl) {
     // 两个代理都允许为空：都为空则直连。
     // DOWNLOAD_PROXY 是真正 HTTP 代理，优先级最高；设置后不再使用 PROXY_DOMAIN 改写 URL，避免双代理冲突。
     if (getDownloadProxy() || !proxyDomain || !originalUrl) {
+        return originalUrl;
+    }
+    // 本地 playlist 不走域名改写
+    if (isLocalMediaPath(originalUrl)) {
         return originalUrl;
     }
     const prefix = proxyDomain.replace(/\/+$/, '') + '/';
@@ -121,6 +133,36 @@ function parseIv(value, sequence) {
     return Buffer.from(hex, 'hex');
 }
 
+/**
+ * 解析 playlist 内 URI。
+ * 本地 m3u8 路径（/tmp/xxx.m3u8）不能直接当 new URL 的 base，
+ * 否则即便分片已是 https 绝对地址也会抛 Invalid URL。
+ */
+function resolvePlaylistUri(uri, playlistUrl) {
+    const text = String(uri || '').trim();
+    if (!text) throw new Error('playlist URI 为空');
+
+    if (/^https?:\/\//i.test(text)) return text;
+    if (text.startsWith('//')) return `https:${text}`;
+
+    const base = String(playlistUrl || '').trim();
+    if (!base) throw new Error(`无法解析相对 URI（缺少 playlist base）: ${text}`);
+
+    // 本地文件路径 → file:// base；http(s)/file playlist 原样
+    let baseUrl = base;
+    if (isLocalMediaPath(base)) {
+        baseUrl = path.isAbsolute(base)
+            ? `file://${base}`
+            : `file://${path.resolve(base)}`;
+    }
+
+    try {
+        return new URL(text, baseUrl).href;
+    } catch (e) {
+        throw new Error(`无法解析 playlist URI: ${text} (base=${base})`);
+    }
+}
+
 function parseMediaPlaylist(content, playlistUrl) {
     const lines = String(content || '').split(/\r?\n/);
     let mediaSequence = 0;
@@ -146,7 +188,7 @@ function parseMediaPlaylist(content, playlistUrl) {
                 if (!attrs.URI) throw new Error('EXT-X-KEY 缺少 URI');
                 currentKey = {
                     method,
-                    uri: new URL(attrs.URI, playlistUrl).href,
+                    uri: resolvePlaylistUri(attrs.URI, playlistUrl),
                     ivAttr: attrs.IV || null,
                 };
             } else {
@@ -159,7 +201,7 @@ function parseMediaPlaylist(content, playlistUrl) {
 
         const sequence = mediaSequence + segments.length;
         segments.push({
-            url: new URL(line, playlistUrl).href,
+            url: resolvePlaylistUri(line, playlistUrl),
             sequence,
             key: currentKey
                 ? {
@@ -207,8 +249,28 @@ async function downloadM3U8(m3u8Url, outputPath, onProgress, serverState, refere
 
         let currentUrl = m3u8Url;
         let content = "";
-        
+
         while (true) {
+            if (isLocalMediaPath(currentUrl)) {
+                if (!await fs.pathExists(currentUrl)) {
+                    throw new Error(`本地 m3u8 不存在: ${currentUrl}`);
+                }
+                content = await fs.readFile(currentUrl, 'utf8');
+                // 本地文件一般是插件改写后的媒体列表；若仍是 master 则要求子路径为绝对 URL
+                if (content.includes('#EXT-X-STREAM-INF')) {
+                    const lines = content.split('\n');
+                    const subPath = lines.find(l => l && !l.startsWith('#') && l.trim());
+                    if (!subPath) throw new Error("在本地M3U8中找不到子播放列表路径");
+                    const trimmed = subPath.trim();
+                    if (!/^https?:\/\//i.test(trimmed)) {
+                        throw new Error(`本地 master m3u8 的子列表必须是绝对 URL: ${trimmed}`);
+                    }
+                    currentUrl = trimmed;
+                    continue;
+                }
+                break;
+            }
+
             const playlistUrl = applyProxy(currentUrl);
             let res;
             try {
@@ -359,4 +421,4 @@ async function downloadM3U8(m3u8Url, outputPath, onProgress, serverState, refere
     }
 }
 
-module.exports = { downloadM3U8 };
+module.exports = { downloadM3U8, isLocalMediaPath };

@@ -5,16 +5,33 @@
  *   - 6477-1-1
  *   - https://dm.danzhuacg.com/vodpp/6477-1-1
  *
- * Returns the player M3U8 URL plus a cutRanges hint for the main ffmpeg
- * compression step to remove 06:04-06:24.
+ * 解析出播放器 m3u8 后，先用 EXTINF 粗略估计 06:03～06:04 附近的 TS 范围，
+ * 只下载这个候选窗口内的片段；再用已验证的广告字节特征（首片 1796904 bytes，
+ * 广告片通常 > 1MiB）定位首个广告 TS，删除它及后 4 个片段，最后改写 m3u8
+ * 到 /tmp 交给主程序下载。
  */
 
 const axios = require('axios');
+const { spawnSync } = require('child_process');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 
 const SITE = 'https://dm.danzhuacg.com';
 const HOST = 'dm.danzhuacg.com';
-const AD_START_SECONDS = 6 * 60 + 3.8;
-const AD_END_SECONDS = 6 * 60 + 24;
+/** 播放器时间轴上的广告点位：约 06:03～06:04 */
+const AD_START_SECONDS = 6 * 60 + 3;
+const AD_END_SECONDS = 6 * 60 + 4;
+/** 从首个广告 TS 起连续删除的分片数（含首个） */
+const AD_SEGMENT_COUNT = 5;
+/** 首个广告 TS 的稳定字节特征；候选窗口内优先用它定位 */
+const FIRST_AD_BYTES = 1796904;
+const FIRST_AD_BYTES_TOLERANCE = 4096;
+/** 广告片通常大于 1MiB；仅作 exact bytes 找不到时的兜底 */
+const BIG_AD_BYTES = 1024 * 1024;
+/** 候选窗口：粗估索引前后各取若干片，只下载这个小窗口 */
+const AD_SEARCH_BEFORE_SEGMENTS = 5;
+const AD_SEARCH_AFTER_SEGMENTS = 8;
 const DEFAULT_UA =
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
 
@@ -201,6 +218,455 @@ async function fetchText(url, refererUrl, accept = '*/*') {
     return typeof res.data === 'string' ? res.data : String(res.data);
 }
 
+async function fetchBuffer(url, refererUrl) {
+    const res = await http.get(url, {
+        responseType: 'arraybuffer',
+        headers: {
+            Accept: '*/*',
+            Referer: refererUrl || SITE + '/',
+            Origin: new URL(refererUrl || SITE).origin,
+        },
+    });
+    return Buffer.from(res.data);
+}
+
+function resolveSegmentUrl(uri, playlistUrl) {
+    const text = String(uri || '').trim();
+    if (!text) return text;
+    if (text.startsWith('http://') || text.startsWith('https://')) return text;
+    if (text.startsWith('//')) return `https:${text}`;
+    return new URL(text, playlistUrl).href;
+}
+
+/**
+ * 解析媒体 m3u8，保留重建所需字段。
+ * segments[i] = { duration, url, name, extinfLine, uriLine }
+ */
+function parseM3u8Media(content, playlistUrl) {
+    const lines = String(content || '').split(/\r?\n/);
+    const headerLines = [];
+    const segments = [];
+    let pendingExtinf = null;
+    let pendingTags = []; // EXTINF 前的标签（KEY / DISCONTINUITY 等）
+    let sawHeaderEnd = false;
+
+    for (let i = 0; i < lines.length; i++) {
+        const raw = lines[i];
+        const line = raw.trim();
+        if (!line) continue;
+
+        if (line.startsWith('#EXTINF:')) {
+            sawHeaderEnd = true;
+            const duration = parseFloat(line.replace('#EXTINF:', '').replace(',', ''));
+            pendingExtinf = {
+                duration: Number.isFinite(duration) && duration > 0 ? duration : 0,
+                extinfLine: line,
+                tags: pendingTags,
+            };
+            pendingTags = [];
+            continue;
+        }
+
+        if (line.startsWith('#')) {
+            if (!sawHeaderEnd && !line.startsWith('#EXT-X-ENDLIST')) {
+                // 头部：VERSION / TARGETDURATION / MEDIA-SEQUENCE / PLAYLIST-TYPE 等
+                // KEY / DISCONTINUITY 也可能出现在头部落到首段前，这里仍进 header
+                if (
+                    line.startsWith('#EXT-X-KEY:')
+                    || line.startsWith('#EXT-X-DISCONTINUITY')
+                    || line.startsWith('#EXT-X-MAP:')
+                ) {
+                    pendingTags.push(line);
+                } else if (!line.startsWith('#EXT-X-ENDLIST')) {
+                    headerLines.push(line);
+                }
+            } else if (
+                line.startsWith('#EXT-X-KEY:')
+                || line.startsWith('#EXT-X-DISCONTINUITY')
+                || line.startsWith('#EXT-X-MAP:')
+                || line.startsWith('#EXT-X-PROGRAM-DATE-TIME:')
+            ) {
+                pendingTags.push(line);
+            }
+            continue;
+        }
+
+        // URI 行
+        if (pendingExtinf) {
+            const url = resolveSegmentUrl(line, playlistUrl);
+            const name = line.split('?')[0].split('/').pop();
+            segments.push({
+                duration: pendingExtinf.duration,
+                url,
+                name,
+                extinfLine: pendingExtinf.extinfLine,
+                tags: pendingExtinf.tags,
+                uriLine: url,
+            });
+            pendingExtinf = null;
+        }
+    }
+
+    return { headerLines, segments };
+}
+
+/** 处理多码率 master playlist，跟随到实际媒体列表 */
+async function resolvePlaylist(url, refererUrl) {
+    let currentUrl = url;
+    for (let depth = 0; depth < 3; depth++) {
+        const content = await fetchText(currentUrl, refererUrl, 'application/vnd.apple.mpegurl,*/*');
+        const lines = content.split('\n');
+        let subPath = null;
+        for (let i = 0; i < lines.length; i++) {
+            if (lines[i].startsWith('#EXT-X-STREAM-INF')) {
+                const candidate = lines[i + 1]?.trim();
+                if (candidate && !candidate.startsWith('#')) {
+                    subPath = candidate;
+                    break;
+                }
+            }
+        }
+        if (!subPath) {
+            return { content, url: currentUrl };
+        }
+        currentUrl = subPath.startsWith('http')
+            ? subPath
+            : (subPath.startsWith('/')
+                ? new URL(subPath, currentUrl).href
+                : currentUrl.substring(0, currentUrl.lastIndexOf('/') + 1) + subPath);
+    }
+    throw new Error('m3u8 多码率嵌套过深');
+}
+
+/** 用 ffprobe 读取 TS 真实播放时长（秒） */
+function getRealDuration(file) {
+    const r = spawnSync('ffprobe', [
+        '-v', 'error',
+        '-show_entries', 'format=duration',
+        '-of', 'default=noprint_wrappers=1:nokey=1',
+        file,
+    ], { timeout: 10000, encoding: 'utf8' });
+
+    if (r.status !== 0) return null;
+    const out = String(r.stdout || '').trim();
+    const lines = out.split('\n').filter((l) => /^[\d.]+$/.test(l.trim()));
+    if (!lines.length) return null;
+    const value = parseFloat(lines[lines.length - 1]);
+    return Number.isFinite(value) && value > 0 ? value : null;
+}
+
+/** 用 EXTINF 粗估目标时间落在哪个片段索引 */
+function approxSegmentIndex(segments, targetTime) {
+    let cum = 0;
+    for (let i = 0; i < segments.length; i++) {
+        const dur = segments[i].duration || 0;
+        if (cum <= targetTime && targetTime < cum + dur) return i;
+        cum += dur;
+    }
+    cum = 0;
+    let last = -1;
+    for (let i = 0; i < segments.length; i++) {
+        if (cum <= targetTime) last = i;
+        cum += segments[i].duration || 0;
+    }
+    return last;
+}
+
+/**
+ * 粗略估计广告候选窗口，只下载这个小范围内的 TS 做字节/ffprobe 识别。
+ */
+function buildCandidateWindow(segments) {
+    const startIdx = approxSegmentIndex(segments, AD_START_SECONDS);
+    const endIdx = approxSegmentIndex(segments, AD_END_SECONDS);
+    const lo = Math.min(
+        startIdx >= 0 ? startIdx : Number.MAX_SAFE_INTEGER,
+        endIdx >= 0 ? endIdx : Number.MAX_SAFE_INTEGER
+    );
+    const hi = Math.max(startIdx, endIdx);
+
+    if (hi < 0 || lo === Number.MAX_SAFE_INTEGER) {
+        return { start: 0, end: Math.min(segments.length - 1, AD_SEARCH_AFTER_SEGMENTS) };
+    }
+
+    return {
+        start: Math.max(0, lo - AD_SEARCH_BEFORE_SEGMENTS),
+        end: Math.min(segments.length - 1, hi + AD_SEARCH_AFTER_SEGMENTS),
+        approxStartIndex: startIdx,
+        approxEndIndex: endIdx,
+    };
+}
+
+/** 下载候选窗口内的 TS，记录 bytes 和可诊断的 realDuration。 */
+async function probeCandidateWindow(segments, refererUrl) {
+    const window = buildCandidateWindow(segments);
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'danzhu-ts-'));
+
+    try {
+        let measured = 0;
+        for (let i = window.start; i <= window.end; i++) {
+            const seg = segments[i];
+            const filepath = path.join(tmpDir, `${i}_${seg.name || 'seg.ts'}`);
+            try {
+                const data = await fetchBuffer(seg.url, refererUrl);
+                seg.bytes = data.length;
+                fs.writeFileSync(filepath, data);
+                const dur = getRealDuration(filepath);
+                if (dur != null) {
+                    seg.realDuration = dur;
+                    measured += 1;
+                }
+            } catch (e) {
+                seg.probeError = e.message || String(e);
+            }
+        }
+
+        const candidates = [];
+        for (let i = window.start; i <= window.end; i++) {
+            const seg = segments[i];
+            candidates.push({
+                index: i,
+                tsNumber: i + 1,
+                duration: seg.duration,
+                realDuration: seg.realDuration || null,
+                bytes: seg.bytes || null,
+                name: seg.name,
+                error: seg.probeError || null,
+            });
+        }
+
+        return { ...window, measured, candidates };
+    } finally {
+        try {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        } catch (_) {
+            /* ignore */
+        }
+    }
+}
+
+function chooseFirstAdIndex(segments, probe) {
+    const candidates = [];
+    for (let i = probe.start; i <= probe.end; i++) {
+        const seg = segments[i];
+        if (seg && Number.isFinite(seg.bytes)) candidates.push({ index: i, seg });
+    }
+
+    const exact = candidates.find(({ seg }) => seg.bytes === FIRST_AD_BYTES);
+    if (exact) {
+        return { index: exact.index, reason: `bytes == ${FIRST_AD_BYTES}` };
+    }
+
+    const nearExact = candidates
+        .map(({ index, seg }) => ({ index, seg, diff: Math.abs(seg.bytes - FIRST_AD_BYTES) }))
+        .filter((item) => item.diff <= FIRST_AD_BYTES_TOLERANCE)
+        .sort((a, b) => a.diff - b.diff || a.index - b.index)[0];
+    if (nearExact) {
+        return { index: nearExact.index, reason: `bytes ~= ${FIRST_AD_BYTES} (diff=${nearExact.diff})` };
+    }
+
+    // 兜底：广告片通常 >1MiB。为避免选中更早的正片大分片，从粗估点前 2 片开始找。
+    const anchor = Math.max(0, Math.min(
+        Number.isFinite(probe.approxStartIndex) && probe.approxStartIndex >= 0 ? probe.approxStartIndex : probe.start,
+        Number.isFinite(probe.approxEndIndex) && probe.approxEndIndex >= 0 ? probe.approxEndIndex : probe.end
+    ) - 2);
+    const big = candidates.find(({ index, seg }) => index >= anchor && seg.bytes > BIG_AD_BYTES);
+    if (big) {
+        return { index: big.index, reason: `bytes > ${BIG_AD_BYTES} (anchor=${anchor})` };
+    }
+
+    const fallback = Number.isFinite(probe.approxEndIndex) && probe.approxEndIndex >= 0
+        ? probe.approxEndIndex
+        : (Number.isFinite(probe.approxStartIndex) && probe.approxStartIndex >= 0 ? probe.approxStartIndex : probe.start);
+    return { index: fallback, reason: 'fallback: EXTINF rough estimate' };
+}
+
+/**
+ * 从首个广告 TS 起连续取 count 个索引删除。
+ * 例：firstIdx=89, count=5 → {89,90,91,92,93}
+ */
+function buildRemoveSetFromFirst(firstIdx, count, total) {
+    const remove = new Set();
+    if (firstIdx < 0 || !Number.isFinite(firstIdx)) return remove;
+    const n = Math.max(1, Math.floor(count || AD_SEGMENT_COUNT));
+    for (let i = 0; i < n; i++) {
+        const idx = firstIdx + i;
+        if (idx >= 0 && idx < total) remove.add(idx);
+    }
+    return remove;
+}
+
+/**
+ * 重建去掉广告片段后的 m3u8。
+ * 分片 URI 一律写成绝对地址，便于主程序从本地 playlist 解析。
+ * 中间挖掉广告后插入 DISCONTINUITY，避免时间戳跳变。
+ */
+function buildCleanM3u8(headerLines, segments, removeSet) {
+    const out = [];
+    const headers = headerLines.length ? [...headerLines] : ['#EXTM3U'];
+    if (!headers.some((l) => l.startsWith('#EXTM3U'))) {
+        headers.unshift('#EXTM3U');
+    }
+
+    // 重新计算 TARGETDURATION
+    let maxDur = 0;
+    for (let i = 0; i < segments.length; i++) {
+        if (removeSet.has(i)) continue;
+        maxDur = Math.max(maxDur, segments[i].duration || 0);
+    }
+    const targetDur = Math.max(1, Math.ceil(maxDur || 1));
+
+    for (const line of headers) {
+        if (line.startsWith('#EXT-X-TARGETDURATION:')) {
+            out.push(`#EXT-X-TARGETDURATION:${targetDur}`);
+        } else {
+            out.push(line);
+        }
+    }
+    if (!headers.some((l) => l.startsWith('#EXT-X-TARGETDURATION:'))) {
+        out.push(`#EXT-X-TARGETDURATION:${targetDur}`);
+    }
+
+    let removedGap = false;
+    let kept = 0;
+    for (let i = 0; i < segments.length; i++) {
+        if (removeSet.has(i)) {
+            removedGap = true;
+            continue;
+        }
+        const seg = segments[i];
+        if (removedGap && kept > 0) {
+            out.push('#EXT-X-DISCONTINUITY');
+        }
+        removedGap = false;
+        for (const tag of seg.tags || []) {
+            // KEY URI 也绝对化
+            if (tag.startsWith('#EXT-X-KEY:')) {
+                out.push(absolutizeKeyLine(tag, seg.url));
+            } else {
+                out.push(tag);
+            }
+        }
+        out.push(seg.extinfLine);
+        out.push(seg.url);
+        kept += 1;
+    }
+
+    if (!out.some((l) => l.startsWith('#EXT-X-ENDLIST'))) {
+        out.push('#EXT-X-ENDLIST');
+    }
+
+    if (kept === 0) {
+        throw new Error('剔除广告后 m3u8 无剩余分片');
+    }
+
+    return `${out.join('\n')}\n`;
+}
+
+function absolutizeKeyLine(keyLine, baseUrl) {
+    const m = /URI="([^"]+)"/i.exec(keyLine) || /URI=([^,]+)/i.exec(keyLine);
+    if (!m) return keyLine;
+    const raw = m[1].trim().replace(/^"|"$/g, '');
+    try {
+        const abs = resolveSegmentUrl(raw, baseUrl);
+        return keyLine.replace(m[0], m[0].includes('"') ? `URI="${abs}"` : `URI=${abs}`);
+    } catch (_) {
+        return keyLine;
+    }
+}
+
+/**
+ * 定位广告分片 → 写本地 m3u8。
+ * 失败时回退：仍写一份「未裁切」的绝对路径 m3u8，保证主流程可下载。
+ */
+async function buildAdFreeM3u8File(m3u8Url, refererUrl, episodeId) {
+    const { content, url: resolvedUrl } = await resolvePlaylist(m3u8Url, refererUrl);
+    const { headerLines, segments } = parseM3u8Media(content, resolvedUrl);
+    if (!segments.length) {
+        throw new Error('m3u8 未解析到任何 TS 分片');
+    }
+
+    let removeSet = new Set();
+    let probeMeta = { reason: 'skipped' };
+    let firstAdIdx = -1;
+
+    try {
+        // 1) EXTINF 粗略估计 06:03～06:04 附近，只下载小窗口内的 TS
+        const probe = await probeCandidateWindow(segments, refererUrl);
+        // 2) 使用已验证的字节特征优先定位广告首片：1796904 bytes > 近似 > 大于 1MiB > EXTINF 兜底
+        const choice = chooseFirstAdIndex(segments, probe);
+        firstAdIdx = choice.index;
+        // 3) 从首片起连续删除 5 个 TS
+        removeSet = buildRemoveSetFromFirst(firstAdIdx, AD_SEGMENT_COUNT, segments.length);
+
+        const removedIndexes = [...removeSet].sort((a, b) => a - b);
+        const removedTsNumbers = removedIndexes.map((idx) => idx + 1);
+        probeMeta = {
+            adStartSeconds: AD_START_SECONDS,
+            adEndSeconds: AD_END_SECONDS,
+            firstAdBytes: FIRST_AD_BYTES,
+            bigAdBytes: BIG_AD_BYTES,
+            selectionReason: choice.reason,
+            approxStartIndex: probe.approxStartIndex,
+            approxStartTsNumber: Number.isFinite(probe.approxStartIndex) && probe.approxStartIndex >= 0 ? probe.approxStartIndex + 1 : null,
+            approxEndIndex: probe.approxEndIndex,
+            approxEndTsNumber: Number.isFinite(probe.approxEndIndex) && probe.approxEndIndex >= 0 ? probe.approxEndIndex + 1 : null,
+            firstAdIndex: firstAdIdx,
+            firstAdTsNumber: firstAdIdx + 1,
+            // 兼容旧字段：firstAdIdx 是 0-based，不是 grep/sed 的行号
+            firstAdIdx,
+            adSegmentCount: AD_SEGMENT_COUNT,
+            measured: probe.measured,
+            window: [probe.start, probe.end],
+            windowTsNumbers: [probe.start + 1, probe.end + 1],
+            candidates: probe.candidates,
+            removedIndexes,
+            removedTsNumbers,
+            // removed 使用 grep/sed 能直接对照的 1-based TS 编号
+            removed: removedTsNumbers,
+            removedCount: removeSet.size,
+        };
+    } catch (e) {
+        probeMeta = { reason: 'probe-failed', error: e.message || String(e) };
+        removeSet = new Set();
+        firstAdIdx = -1;
+    }
+
+    // 探测失败时：仅用 EXTINF 粗估 06:04 所在片，仍连续删 5 个
+    if (removeSet.size === 0) {
+        firstAdIdx = approxSegmentIndex(segments, AD_END_SECONDS);
+        removeSet = buildRemoveSetFromFirst(firstAdIdx, AD_SEGMENT_COUNT, segments.length);
+        if (removeSet.size) {
+            const removedIndexes = [...removeSet].sort((a, b) => a - b);
+            const removedTsNumbers = removedIndexes.map((idx) => idx + 1);
+            probeMeta.fallback = 'extinf-only';
+            probeMeta.adStartSeconds = AD_START_SECONDS;
+            probeMeta.adEndSeconds = AD_END_SECONDS;
+            probeMeta.firstAdIndex = firstAdIdx;
+            probeMeta.firstAdTsNumber = firstAdIdx + 1;
+            probeMeta.firstAdIdx = firstAdIdx;
+            probeMeta.adSegmentCount = AD_SEGMENT_COUNT;
+            probeMeta.removedIndexes = removedIndexes;
+            probeMeta.removedTsNumbers = removedTsNumbers;
+            probeMeta.removed = removedTsNumbers;
+            probeMeta.removedCount = removeSet.size;
+        }
+    }
+
+    const cleanContent = buildCleanM3u8(headerLines, segments, removeSet);
+    const safeId = String(episodeId || 'ep').replace(/[^\w.-]+/g, '_');
+    const outPath = path.join(os.tmpdir(), `danzhu_${safeId}_${Date.now()}.m3u8`);
+    fs.writeFileSync(outPath, cleanContent, 'utf8');
+
+    return {
+        localPath: outPath,
+        originalUrl: m3u8Url,
+        resolvedUrl,
+        totalSegments: segments.length,
+        removedCount: removeSet.size,
+        probeMeta,
+    };
+}
+
 async function download(input, options = {}) {
     const { id, pageUrl } = normalizeInput(input);
 
@@ -209,25 +675,32 @@ async function download(input, options = {}) {
     const player = parsePlayerAaaa(pageHtml);
     const m3u8Url = extractM3U8Url(player, pageUrl);
 
-    if (options.meta) {
-        return {
-            url: m3u8Url,
-            pageUrl,
-            pageTitle,
-            title: pageTitle,
-            episodeId: id,
-            cutRanges: [{ start: AD_START_SECONDS, end: AD_END_SECONDS }],
-        };
-    }
+    const adFree = await buildAdFreeM3u8File(m3u8Url, pageUrl, id);
 
-    return m3u8Url;
+    // 返回本地 m3u8 路径；主程序按 m3u8 下载分片（分片仍是远程绝对 URL）
+    // 不再返回 cutRanges —— 广告已在 playlist 层剔除
+    return {
+        url: adFree.localPath,
+        pageUrl,
+        pageTitle,
+        title: pageTitle,
+        episodeId: id,
+        originalM3u8: m3u8Url,
+        adCut: {
+            removedCount: adFree.removedCount,
+            totalSegments: adFree.totalSegments,
+            localM3u8: adFree.localPath,
+            ...adFree.probeMeta,
+        },
+    };
 }
 
 module.exports = {
     download,
     normalizeInput,
     AD_START_SECONDS,
-    AD_END_SECONDS,
+    AD_SEGMENT_COUNT,
+    buildAdFreeM3u8File,
 };
 
 if (require.main === module) {
