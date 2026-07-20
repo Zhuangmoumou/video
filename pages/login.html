@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="Video Console 登录页">
+    <title>Video Console Login</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/ui/styles.css">
+    <script defer src="/ui/login.js"></script>
+</head>
+<body class="login-page">
+    <main class="page-shell login-shell">
+        <section class="login-card-simple">
+            <div class="login-card-copy">
+                <div class="brand">Video Console</div>
+                <p class="subtitle">输入访问密码进入控制台</p>
+            </div>
+
+            <form id="auth-form" class="auth-form">
+                <label class="field">
+                    <span>访问密码</span>
+                    <input id="auth-password" type="password" autocomplete="current-password" placeholder="输入后进入控制台">
+                </label>
+                <button id="auth-submit" class="primary auth-submit" type="submit">进入控制台</button>
+                <p id="auth-feedback" class="auth-feedback" data-tone="muted">正在检查访问权限...</p>
+            </form>
+        </section>
+    </main>
+</body>
+</html>

@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="Video Console 控制台">
+    <title>Video Console</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/ui/styles.css">
+    <script defer src="/ui/console.js"></script>
+</head>
+<body class="console-page">
+    <div class="page-shell console-shell">
+        <header class="topbar">
+            <div class="topbar-copy">
+                <div class="brand">Video Console</div>
+                <p class="subtitle">受保护的控制台 · 对接现有下载接口</p>
+            </div>
+            <div class="topbar-status">
+                <span id="server-status">空闲</span>
+                <span id="api-status">等待加载</span>
+                <button class="secondary" type="button" id="logout-btn">退出登录</button>
+            </div>
+        </header>
+
+        <section class="workspace">
+            <section class="panel composer">
+                <div class="panel-head">
+                    <h1>提交任务</h1>
+                    <div class="head-meta">
+                        <span id="task-id">#000000</span>
+                        <button class="icon-btn" type="button" id="regen-code">刷新编号</button>
+                    </div>
+                </div>
+
+                <form id="task-form" class="form-grid">
+                    <label class="field">
+                        <span>来源</span>
+                        <select id="origin-select"></select>
+                    </label>
+
+                    <label class="field field-wide">
+                        <span>编号 / 链接</span>
+                        <textarea id="input-text" placeholder="例如：123-1-1 或完整 URL"></textarea>
+                    </label>
+
+                    <label class="field">
+                        <span>文件名</span>
+                        <input id="file-input" type="text" placeholder="留空则自动使用编号">
+                    </label>
+
+                    <label class="field">
+                        <span>插件</span>
+                        <select id="mod-select"></select>
+                    </label>
+
+                    <label class="field">
+                        <span>分辨率</span>
+                        <select id="resolution-select"></select>
+                    </label>
+
+                    <div class="field field-wide">
+                        <span>来源模板</span>
+                        <input id="source-preview" type="text" readonly>
+                    </div>
+
+                    <div class="actions field-wide">
+                        <button class="primary" type="submit">开始下载</button>
+                        <button class="secondary" type="button" id="stop-btn">停止任务</button>
+                        <button class="secondary" type="button" id="clear-btn">清空输出</button>
+                    </div>
+                </form>
+            </section>
+
+            <section class="panel panel-log">
+                <div class="panel-head">
+                    <h2>实时回显</h2>
+                    <button class="icon-btn" type="button" id="refresh-state">刷新</button>
+                </div>
+                <pre id="log-view" class="log-view">正在初始化...</pre>
+            </section>
+        </section>
+
+        <section class="footer-grid">
+            <section class="panel">
+                <div class="panel-head">
+                    <h2>输出文件</h2>
+                    <button class="icon-btn" type="button" id="refresh-files">刷新</button>
+                </div>
+                <div id="file-list" class="list"></div>
+            </section>
+
+            <section class="panel">
+                <div class="panel-head">
+                    <h2>来源模板</h2>
+                </div>
+                <div id="template-list" class="template-list"></div>
+            </section>
+        </section>
+    </div>
+</body>
+</html>

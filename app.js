@@ -6,19 +6,35 @@ const ffmpeg = require('fluent-ffmpeg');
 const axios = require('axios');
 const fs = require('fs-extra');
 const path = require('path');
+const crypto = require('crypto');
 const { spawn } = require('child_process');
 const { downloadM3U8 } = require('./m3u8Downloader');
 const { createProgressLimiter, createSpeedAverager } = require('./progressLimiter');
+const createApiRouter = require('./apiRouter');
 
 const app = express();
+app.disable('x-powered-by');
 const PORT = 9898;
 
 const ROOT_DIR = path.join(process.cwd(), 'mp4');
 const OUT_DIR = path.join(ROOT_DIR, 'out');
 const MOD_DIR = path.join(process.cwd(), 'mod');
+const PUBLIC_DIR = path.join(process.cwd(), 'public');
+const PAGE_DIR = path.join(process.cwd(), 'pages');
+const CONFIG_FILE = path.join(process.cwd(), 'config.json');
 fs.ensureDirSync(ROOT_DIR);
 fs.ensureDirSync(OUT_DIR);
 fs.ensureDirSync(MOD_DIR);
+fs.ensureDirSync(PUBLIC_DIR);
+fs.ensureDirSync(PAGE_DIR);
+
+const SESSION_COOKIE_NAME = 'video_console_session';
+const DEFAULT_AUTH_SESSION_TTL_MS = 12 * 60 * 60 * 1000;
+const DEFAULT_LOGIN_WINDOW_MS = 15 * 60 * 1000;
+const DEFAULT_LOGIN_BLOCK_MS = 30 * 60 * 1000;
+const DEFAULT_LOGIN_MAX_ATTEMPTS = 5;
+const authSessions = new Map();
+const authLoginAttempts = new Map();
 
 // === 插件系统 ===
 /** @type {Map<string, { name: string, file: string, download: Function }>} */
@@ -445,6 +461,479 @@ const buildDownloadHeaders = async (context, refererUrl, mediaUrl) => {
 };
 
 const SCALE_FILTER = 'scale=320:170:force_original_aspect_ratio=decrease,pad=320:170:(ow-iw)/2:(oh-ih)/2';
+const API_DEFAULT_RESOLUTION = 'api-default';
+const FRONTEND_DEFAULT_RESOLUTION = '720p';
+
+const buildBoundedScaleFilter = (width, height) =>
+    `scale=w='min(${width},iw)':h='min(${height},ih)':force_original_aspect_ratio=decrease:force_divisible_by=2`;
+
+const RESOLUTION_PRESETS = Object.freeze({
+    [API_DEFAULT_RESOLUTION]: {
+        id: API_DEFAULT_RESOLUTION,
+        label: '320x170',
+        description: '兼容现有 API 的默认压缩分辨率',
+        scaleFilter: SCALE_FILTER,
+        passthrough: false,
+        ui: false
+    },
+    source: {
+        id: 'source',
+        label: '原画质',
+        description: '保留原始分辨率；无裁剪时直接输出',
+        scaleFilter: null,
+        passthrough: true,
+        ui: true
+    },
+    '1080p': {
+        id: '1080p',
+        label: '1080p',
+        description: '最长边压到 1080p 以内，保留比例',
+        scaleFilter: buildBoundedScaleFilter(1920, 1080),
+        passthrough: false,
+        ui: true
+    },
+    '720p': {
+        id: '720p',
+        label: '720p',
+        description: '平衡体积与清晰度的常用档位',
+        scaleFilter: buildBoundedScaleFilter(1280, 720),
+        passthrough: false,
+        ui: true
+    },
+    '480p': {
+        id: '480p',
+        label: '480p',
+        description: '更小体积，适合快速归档',
+        scaleFilter: buildBoundedScaleFilter(854, 480),
+        passthrough: false,
+        ui: true
+    },
+    '360p': {
+        id: '360p',
+        label: '360p',
+        description: '最低档位，优先压缩体积',
+        scaleFilter: buildBoundedScaleFilter(640, 360),
+        passthrough: false,
+        ui: true
+    }
+});
+
+const FRONTEND_RESOLUTION_ORDER = ['source', '1080p', '720p', '480p', '360p'];
+
+const RESOLUTION_ALIASES = Object.freeze({
+    default: API_DEFAULT_RESOLUTION,
+    legacy: API_DEFAULT_RESOLUTION,
+    '320x170': API_DEFAULT_RESOLUTION,
+    source: 'source',
+    original: 'source',
+    raw: 'source',
+    passthrough: 'source',
+    '原画质': 'source',
+    '1080': '1080p',
+    '1080p': '1080p',
+    '720': '720p',
+    '720p': '720p',
+    '480': '480p',
+    '480p': '480p',
+    '360': '360p',
+    '360p': '360p'
+});
+
+const normalizeResolutionValue = (value, fallback = API_DEFAULT_RESOLUTION) => {
+    if (value == null || value === '') return fallback;
+    const raw = String(value).trim();
+    const alias = RESOLUTION_ALIASES[raw.toLowerCase()] || RESOLUTION_ALIASES[raw] || raw;
+    const preset = RESOLUTION_PRESETS[alias];
+    if (!preset) {
+        throw new Error(`不支持的分辨率选项: ${raw}`);
+    }
+    return preset.id;
+};
+
+const getCompressionProfile = (value, fallback = API_DEFAULT_RESOLUTION) => {
+    const presetId = normalizeResolutionValue(value, fallback);
+    return RESOLUTION_PRESETS[presetId];
+};
+
+const getUiResolutionOptions = () => FRONTEND_RESOLUTION_ORDER.map((id) => {
+    const preset = RESOLUTION_PRESETS[id];
+    return {
+        id: preset.id,
+        label: preset.label,
+        description: preset.description
+    };
+});
+
+const getVideoCrf = (profile) => (profile?.id === 'source' ? '15' : '17');
+
+const readRuntimeConfig = async () => {
+    try {
+        const raw = await fs.readJson(CONFIG_FILE);
+        return raw && typeof raw === 'object' ? raw : {};
+    } catch (e) {
+        return {};
+    }
+};
+
+const getOriginConfig = async () => {
+    const raw = await readRuntimeConfig();
+    const list = Array.isArray(raw?.origin) ? raw.origin : [];
+    return list
+        .map((item) => ({
+            name: String(item?.name || '').trim(),
+            url: String(item?.url || '').trim()
+        }))
+        .filter((item) => item.name && item.url);
+};
+
+const firstFilledValue = (...values) => {
+    for (const value of values) {
+        const text = typeof value === 'string' ? value.trim() : value;
+        if (text !== undefined && text !== null && text !== '') {
+            return typeof value === 'string' ? value : text;
+        }
+    }
+    return null;
+};
+
+const readPositiveInteger = (value, fallback, { min = 1, max = Number.MAX_SAFE_INTEGER } = {}) => {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric)) return fallback;
+    const normalized = Math.floor(numeric);
+    if (normalized < min || normalized > max) return fallback;
+    return normalized;
+};
+
+const getUiAuthConfig = async () => {
+    const raw = await readRuntimeConfig();
+    const auth = raw?.auth && typeof raw.auth === 'object' ? raw.auth : {};
+    return {
+        configured: Boolean(firstFilledValue(process.env.VIDEO_UI_PASSWORD_HASH, auth.passwordHash, process.env.VIDEO_UI_PASSWORD, auth.password)),
+        passwordHash: firstFilledValue(process.env.VIDEO_UI_PASSWORD_HASH, auth.passwordHash),
+        password: firstFilledValue(process.env.VIDEO_UI_PASSWORD, auth.password),
+        sessionTtlMs: readPositiveInteger(
+            firstFilledValue(process.env.VIDEO_UI_SESSION_TTL_MS, auth.sessionTtlMs),
+            DEFAULT_AUTH_SESSION_TTL_MS,
+            { min: 60 * 1000, max: 14 * 24 * 60 * 60 * 1000 }
+        ),
+        loginWindowMs: readPositiveInteger(
+            firstFilledValue(process.env.VIDEO_UI_LOGIN_WINDOW_MS, auth.loginWindowMs),
+            DEFAULT_LOGIN_WINDOW_MS,
+            { min: 60 * 1000, max: 24 * 60 * 60 * 1000 }
+        ),
+        loginBlockMs: readPositiveInteger(
+            firstFilledValue(process.env.VIDEO_UI_LOGIN_BLOCK_MS, auth.loginBlockMs),
+            DEFAULT_LOGIN_BLOCK_MS,
+            { min: 60 * 1000, max: 24 * 60 * 60 * 1000 }
+        ),
+        loginMaxAttempts: readPositiveInteger(
+            firstFilledValue(process.env.VIDEO_UI_LOGIN_MAX_ATTEMPTS, auth.loginMaxAttempts),
+            DEFAULT_LOGIN_MAX_ATTEMPTS,
+            { min: 1, max: 20 }
+        )
+    };
+};
+
+const stableDigest = (value) => crypto.createHash('sha256').update(String(value ?? '')).digest();
+
+const safeTextEqual = (left, right) => crypto.timingSafeEqual(stableDigest(left), stableDigest(right));
+
+const verifyScryptPassword = (password, encodedHash) => {
+    try {
+        const [scheme, saltText, hashText] = String(encodedHash || '').split('$');
+        if (scheme !== 'scrypt' || !saltText || !hashText) return false;
+        const salt = Buffer.from(saltText, 'base64');
+        const stored = Buffer.from(hashText, 'base64');
+        if (!salt.length || !stored.length) return false;
+        const derived = crypto.scryptSync(String(password ?? ''), salt, stored.length);
+        return crypto.timingSafeEqual(derived, stored);
+    } catch (e) {
+        return false;
+    }
+};
+
+const verifyUiPassword = async (password, authConfig) => {
+    if (!authConfig?.configured) return false;
+    if (authConfig.passwordHash) {
+        return verifyScryptPassword(password, authConfig.passwordHash);
+    }
+    if (authConfig.password) {
+        return safeTextEqual(password, authConfig.password);
+    }
+    return false;
+};
+
+const parseCookieHeader = (cookieHeader = '') => {
+    const entries = {};
+    for (const chunk of String(cookieHeader).split(';')) {
+        const trimmed = chunk.trim();
+        if (!trimmed) continue;
+        const eqIndex = trimmed.indexOf('=');
+        if (eqIndex <= 0) continue;
+        const key = trimmed.slice(0, eqIndex).trim();
+        const value = trimmed.slice(eqIndex + 1).trim();
+        if (!key) continue;
+        try {
+            entries[key] = decodeURIComponent(value);
+        } catch (e) {
+            entries[key] = value;
+        }
+    }
+    return entries;
+};
+
+const getRequestSessionId = (req) => parseCookieHeader(req.headers.cookie || '')[SESSION_COOKIE_NAME] || null;
+
+const hasSessionCookie = (req) => Boolean(getRequestSessionId(req));
+
+const getClientFingerprint = (req) => crypto.createHash('sha256')
+    .update(`${req.socket?.remoteAddress || ''}\n${req.get('user-agent') || ''}`)
+    .digest('base64');
+
+const cleanupExpiredSessions = () => {
+    const now = Date.now();
+    for (const [sessionId, session] of authSessions.entries()) {
+        if (!session || session.expiresAt <= now) {
+            authSessions.delete(sessionId);
+        }
+    }
+};
+
+const cleanupExpiredLoginAttempts = (authConfig) => {
+    const now = Date.now();
+    const maxAge = Math.max(authConfig.loginWindowMs, authConfig.loginBlockMs);
+    for (const [key, entry] of authLoginAttempts.entries()) {
+        if (!entry || (entry.blockedUntil && entry.blockedUntil <= now && now - entry.windowStartedAt > maxAge)) {
+            authLoginAttempts.delete(key);
+            continue;
+        }
+        if (!entry.blockedUntil && now - entry.windowStartedAt > authConfig.loginWindowMs) {
+            authLoginAttempts.delete(key);
+        }
+    }
+};
+
+const shouldUseSecureCookies = (req) => {
+    const forwardedProto = String(req.headers['x-forwarded-proto'] || '')
+        .split(',')[0]
+        .trim()
+        .toLowerCase();
+    return Boolean(req.secure || forwardedProto === 'https');
+};
+
+const buildSessionCookieOptions = (req, maxAge) => ({
+    httpOnly: true,
+    sameSite: 'strict',
+    secure: shouldUseSecureCookies(req),
+    path: '/',
+    maxAge
+});
+
+const clearSessionCookie = (req, res) => {
+    res.clearCookie(SESSION_COOKIE_NAME, {
+        httpOnly: true,
+        sameSite: 'strict',
+        secure: shouldUseSecureCookies(req),
+        path: '/'
+    });
+};
+
+const createUiSession = (req, authConfig) => {
+    cleanupExpiredSessions();
+    const now = Date.now();
+    const session = {
+        id: crypto.randomBytes(32).toString('base64url'),
+        createdAt: now,
+        updatedAt: now,
+        expiresAt: now + authConfig.sessionTtlMs,
+        fingerprint: getClientFingerprint(req)
+    };
+    authSessions.set(session.id, session);
+    return session;
+};
+
+const getUiSession = (req) => {
+    cleanupExpiredSessions();
+    const sessionId = getRequestSessionId(req);
+    if (!sessionId) return null;
+    const session = authSessions.get(sessionId);
+    if (!session) return null;
+    if (session.expiresAt <= Date.now()) {
+        authSessions.delete(sessionId);
+        return null;
+    }
+    if (session.fingerprint !== getClientFingerprint(req)) {
+        authSessions.delete(sessionId);
+        return null;
+    }
+    return session;
+};
+
+const refreshUiSession = (req, res, session, authConfig) => {
+    const now = Date.now();
+    session.updatedAt = now;
+    session.expiresAt = now + authConfig.sessionTtlMs;
+    authSessions.set(session.id, session);
+    res.cookie(SESSION_COOKIE_NAME, session.id, buildSessionCookieOptions(req, authConfig.sessionTtlMs));
+    return session;
+};
+
+const destroyUiSession = (req, res) => {
+    const sessionId = getRequestSessionId(req);
+    if (sessionId) {
+        authSessions.delete(sessionId);
+    }
+    clearSessionCookie(req, res);
+};
+
+const getLoginAttemptKey = (req) => req.socket?.remoteAddress || 'unknown';
+
+const getLoginAttemptState = (req, authConfig) => {
+    cleanupExpiredLoginAttempts(authConfig);
+    const key = getLoginAttemptKey(req);
+    const entry = authLoginAttempts.get(key);
+    if (!entry) {
+        return {
+            blocked: false,
+            remaining: authConfig.loginMaxAttempts,
+            retryAfterMs: 0
+        };
+    }
+
+    const now = Date.now();
+    if (entry.blockedUntil && entry.blockedUntil > now) {
+        return {
+            blocked: true,
+            remaining: 0,
+            retryAfterMs: entry.blockedUntil - now
+        };
+    }
+
+    if (now - entry.windowStartedAt > authConfig.loginWindowMs) {
+        authLoginAttempts.delete(key);
+        return {
+            blocked: false,
+            remaining: authConfig.loginMaxAttempts,
+            retryAfterMs: 0
+        };
+    }
+
+    return {
+        blocked: false,
+        remaining: Math.max(authConfig.loginMaxAttempts - entry.count, 0),
+        retryAfterMs: 0
+    };
+};
+
+const recordFailedLogin = (req, authConfig) => {
+    cleanupExpiredLoginAttempts(authConfig);
+    const key = getLoginAttemptKey(req);
+    const now = Date.now();
+    const current = authLoginAttempts.get(key);
+    const isNewWindow = !current || now - current.windowStartedAt > authConfig.loginWindowMs;
+    const next = isNewWindow
+        ? { count: 1, windowStartedAt: now, blockedUntil: null }
+        : { ...current, count: current.count + 1 };
+
+    if (next.count >= authConfig.loginMaxAttempts) {
+        next.blockedUntil = now + authConfig.loginBlockMs;
+    }
+
+    authLoginAttempts.set(key, next);
+    return {
+        blocked: Boolean(next.blockedUntil && next.blockedUntil > now),
+        remaining: Math.max(authConfig.loginMaxAttempts - next.count, 0),
+        retryAfterMs: next.blockedUntil ? Math.max(next.blockedUntil - now, 0) : 0
+    };
+};
+
+const clearLoginAttempts = (req) => {
+    authLoginAttempts.delete(getLoginAttemptKey(req));
+};
+
+const sendJsonError = (res, status, code, error) => {
+    res.status(status);
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ code, error });
+};
+
+const sendRequestError = (req, res, status, code, error) => {
+    if (req.path.startsWith('/api/') || req.method !== 'GET' || (req.get('accept') || '').includes('application/json')) {
+        return sendJsonError(res, status, code, error);
+    }
+    res.status(status);
+    res.setHeader('Cache-Control', 'no-store');
+    res.type('text/plain; charset=utf-8').send(error);
+};
+
+const requireSameOrigin = (req, res, next) => {
+    const fetchSite = String(req.get('sec-fetch-site') || '').trim().toLowerCase();
+    if (fetchSite && !['same-origin', 'same-site', 'none'].includes(fetchSite)) {
+        sendRequestError(req, res, 403, 'AUTH_ORIGIN_DENIED', '来源校验失败');
+        return;
+    }
+
+    const origin = String(req.get('origin') || '').trim();
+    if (!origin) {
+        next();
+        return;
+    }
+
+    let originUrl;
+    try {
+        originUrl = new URL(origin);
+    } catch (e) {
+        sendRequestError(req, res, 403, 'AUTH_ORIGIN_DENIED', '来源校验失败');
+        return;
+    }
+
+    if (originUrl.host !== String(req.get('host') || '').trim()) {
+        sendRequestError(req, res, 403, 'AUTH_ORIGIN_DENIED', '来源校验失败');
+        return;
+    }
+
+    next();
+};
+
+const requireUiAuth = async (req, res, next) => {
+    const authConfig = await getUiAuthConfig();
+    if (!authConfig.configured) {
+        destroyUiSession(req, res);
+        sendRequestError(req, res, 503, 'AUTH_NOT_CONFIGURED', '服务端未配置访问密码');
+        return;
+    }
+
+    const session = getUiSession(req);
+    if (!session) {
+        if (hasSessionCookie(req)) {
+            clearSessionCookie(req, res);
+        }
+        sendRequestError(req, res, 401, 'AUTH_REQUIRED', '需要先登录');
+        return;
+    }
+
+    req.auth = {
+        session: refreshUiSession(req, res, session, authConfig),
+        settings: authConfig
+    };
+    next();
+};
+
+const getUiPageAuthState = async (req, res) => {
+    const authConfig = await getUiAuthConfig();
+    const session = authConfig.configured ? getUiSession(req) : null;
+    if (session && authConfig.configured) {
+        refreshUiSession(req, res, session, authConfig);
+    } else if (hasSessionCookie(req)) {
+        clearSessionCookie(req, res);
+    }
+    return { authConfig, session };
+};
+
+const sendUiPage = (res, fileName) => {
+    res.setHeader('Cache-Control', 'no-store');
+    res.sendFile(path.join(PAGE_DIR, fileName));
+};
 
 const formatCutSecond = (value) => Number(value.toFixed(3)).toString();
 
@@ -474,14 +963,18 @@ const formatCutRange = (range) => {
     return `${toClock(range.start)}-${toClock(range.end)}`;
 };
 
-const buildCompressOutputOptions = () => {
-    return [
-        '-vf', SCALE_FILTER,
+const buildCompressOutputOptions = (profile) => {
+    const options = [];
+    if (profile?.scaleFilter) {
+        options.push('-vf', profile.scaleFilter);
+    }
+    options.push(
         '-c:v', 'libx264',
-        '-crf', '17',
+        '-crf', getVideoCrf(profile),
         '-preset', 'medium',
         '-c:a', 'copy'
-    ];
+    );
+    return options;
 };
 
 const probeDuration = (inputPath) => new Promise((resolve) => {
@@ -517,9 +1010,13 @@ const buildKeepRanges = (cutRanges, duration = null) => {
     return ranges;
 };
 
-const buildTrimFilter = (range, audio = false) => {
+const buildTrimFilter = (range, audio = false, profile = RESOLUTION_PRESETS[API_DEFAULT_RESOLUTION]) => {
     const filter = audio ? 'atrim' : 'trim';
-    const reset = audio ? 'asetpts=PTS-STARTPTS' : `setpts=PTS-STARTPTS,${SCALE_FILTER}`;
+    const reset = audio
+        ? 'asetpts=PTS-STARTPTS'
+        : profile?.scaleFilter
+            ? `setpts=PTS-STARTPTS,${profile.scaleFilter}`
+            : 'setpts=PTS-STARTPTS';
     const start = formatCutSecond(range.start);
     const end = Number.isFinite(range.end) ? `:end=${formatCutSecond(range.end)}` : '';
     return `${filter}=start=${start}${end},${reset}`;
@@ -578,11 +1075,24 @@ const concatSegments = async (segmentPaths, tempDir, outPath, serverState) => {
     });
 };
 
-const compressVideo = async (downloadPath, outPath, cutRanges, serverState, updateStatus) => {
+const compressVideo = async (
+    downloadPath,
+    outPath,
+    cutRanges,
+    compressionProfile = RESOLUTION_PRESETS[API_DEFAULT_RESOLUTION],
+    serverState,
+    updateStatus
+) => {
     if (!cutRanges.length) {
+        if (compressionProfile?.passthrough) {
+            updateStatus(null, '📦 原画直出...');
+            await fs.copy(downloadPath, outPath, { overwrite: true });
+            return;
+        }
+
         const shouldReportCompressProgress = createProgressLimiter();
         const cmd = ffmpeg(downloadPath)
-            .outputOptions(buildCompressOutputOptions());
+            .outputOptions(buildCompressOutputOptions(compressionProfile));
 
         await runFfmpegSave(cmd, outPath, serverState, (p) => {
             const percent = Math.floor(p.percent || 0);
@@ -614,10 +1124,10 @@ const compressVideo = async (downloadPath, outPath, cutRanges, serverState, upda
             const segmentPath = path.join(tempDir, `segment_${String(i).padStart(3, '0')}.mp4`);
             const cmd = ffmpeg(downloadPath)
                 .outputOptions([
-                    '-vf', buildTrimFilter(range, false),
-                    '-af', buildTrimFilter(range, true),
+                    '-vf', buildTrimFilter(range, false, compressionProfile),
+                    '-af', buildTrimFilter(range, true, compressionProfile),
                     '-c:v', 'libx264',
-                    '-crf', '17',
+                    '-crf', getVideoCrf(compressionProfile),
                     '-preset', 'medium',
                     '-c:a', 'aac',
                     '-b:a', '192k'
@@ -682,15 +1192,188 @@ const addToBuffer = (type, args) => {
 console.log = (...args) => { addToBuffer('INFO', args); process.stdout.write(args.join(' ') + '\n'); };
 console.error = (...args) => { addToBuffer('ERROR', args); process.stderr.write(args.join(' ') + '\n'); };
 
+const formatBytes = (bytes) => {
+    const value = Number(bytes);
+    if (!Number.isFinite(value) || value < 0) return '0 B';
+    if (value >= 1024 ** 3) return `${(value / 1024 ** 3).toFixed(2)} GB`;
+    if (value >= 1024 ** 2) return `${(value / 1024 ** 2).toFixed(2)} MB`;
+    if (value >= 1024) return `${(value / 1024).toFixed(1)} KB`;
+    return `${Math.round(value)} B`;
+};
+
+const getDownloadEntries = async () => {
+    const files = await fs.readdir(OUT_DIR).catch(() => []);
+    const entries = await Promise.all(files.map(async (file) => {
+        if (file === 'log.txt') return null;
+        const filePath = path.join(OUT_DIR, file);
+        try {
+            const stat = await fs.stat(filePath);
+            if (!stat.isFile()) return null;
+            return {
+                name: file,
+                href: `/dl/${encodeURIComponent(file)}`,
+                bytes: stat.size,
+                sizeText: formatBytes(stat.size),
+                modifiedAt: stat.mtime.toISOString()
+            };
+        } catch (e) {
+            return null;
+        }
+    }));
+
+    return entries
+        .filter(Boolean)
+        .sort((a, b) => new Date(b.modifiedAt).getTime() - new Date(a.modifiedAt).getTime());
+};
+
+const buildUiState = () => {
+    const activeTaskLock = videoTaskLock.getState();
+    return {
+        busy: serverState.isBusy || Boolean(activeTaskLock),
+        code: serverState.currentCode || activeTaskLock?.code || null,
+        task: serverState.currentTask || null,
+        progress: serverState.progressStr || null,
+        queue: serverState.queue || null,
+        lock: getVideoTaskLockStatusLine(),
+        queueStatus: getQueueStatusLine(),
+        logs: logBuffer.slice(-18),
+        mods: ['none', ...mods.keys()],
+        resolutions: getUiResolutionOptions(),
+        defaults: {
+            apiResolution: API_DEFAULT_RESOLUTION,
+            frontendResolution: FRONTEND_DEFAULT_RESOLUTION
+        }
+    };
+};
+
 // === 中间件配置 ===
-app.use(express.json());
-app.use(express.text({ type: '*/*' })); // 允许解析所有类型的文本输入
-app.use(express.urlencoded({ extended: true }));
-app.use('/dl', express.static(OUT_DIR));
+app.use((req, res, next) => {
+    res.setHeader('X-Frame-Options', 'DENY');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Referrer-Policy', 'no-referrer');
+    res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
+    res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+    res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+    res.setHeader(
+        'Content-Security-Policy',
+        "default-src 'self'; script-src 'self'; connect-src 'self'; img-src 'self' data: blob:; style-src 'self' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
+    );
+    next();
+});
+app.use(express.json({ limit: '256kb' }));
+app.use(express.text({ type: '*/*', limit: '256kb' })); // 允许解析所有类型的文本输入
+app.use(express.urlencoded({ extended: true, limit: '256kb' }));
+app.use('/ui', express.static(PUBLIC_DIR));
+app.use('/dl', express.static(OUT_DIR, {
+    setHeaders(res) {
+        res.setHeader('Cache-Control', 'private, no-store');
+    }
+}));
+app.get(['/', '/login'], async (req, res) => {
+    const { session } = await getUiPageAuthState(req, res);
+    if (session) {
+        res.redirect('/console');
+        return;
+    }
+    sendUiPage(res, 'login.html');
+});
+app.get('/console', async (req, res) => {
+    const { session } = await getUiPageAuthState(req, res);
+    if (!session) {
+        res.redirect('/?reauth=1');
+        return;
+    }
+    sendUiPage(res, 'console.html');
+});
+app.get('/api/auth/status', async (req, res) => {
+    const { authConfig, session } = await getUiPageAuthState(req, res);
+
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({
+        configured: authConfig.configured,
+        authenticated: Boolean(session),
+        sessionExpiresAt: session?.expiresAt || null
+    });
+});
+app.post('/api/auth/login', requireSameOrigin, async (req, res) => {
+    const authConfig = await getUiAuthConfig();
+    if (!authConfig.configured) {
+        sendJsonError(res, 503, 'AUTH_NOT_CONFIGURED', '服务端未配置访问密码');
+        return;
+    }
+
+    const existingSession = getUiSession(req);
+    if (existingSession) {
+        refreshUiSession(req, res, existingSession, authConfig);
+        res.status(204).end();
+        return;
+    }
+
+    const loginState = getLoginAttemptState(req, authConfig);
+    if (loginState.blocked) {
+        const retrySeconds = Math.max(1, Math.ceil(loginState.retryAfterMs / 1000));
+        sendJsonError(res, 429, 'AUTH_RATE_LIMITED', `尝试过多，请在 ${retrySeconds} 秒后再试`);
+        return;
+    }
+
+    const password = typeof req.body?.password === 'string' ? req.body.password : '';
+    if (!password) {
+        sendJsonError(res, 400, 'AUTH_PASSWORD_REQUIRED', '请输入访问密码');
+        return;
+    }
+
+    const verified = await verifyUiPassword(password, authConfig);
+    if (!verified) {
+        const nextState = recordFailedLogin(req, authConfig);
+        if (nextState.blocked) {
+            const retrySeconds = Math.max(1, Math.ceil(nextState.retryAfterMs / 1000));
+            sendJsonError(res, 429, 'AUTH_RATE_LIMITED', `尝试过多，请在 ${retrySeconds} 秒后再试`);
+            return;
+        }
+        sendJsonError(res, 401, 'AUTH_INVALID', '密码错误');
+        return;
+    }
+
+    clearLoginAttempts(req);
+    destroyUiSession(req, res);
+    const session = createUiSession(req, authConfig);
+    res.cookie(SESSION_COOKIE_NAME, session.id, buildSessionCookieOptions(req, authConfig.sessionTtlMs));
+    res.setHeader('Cache-Control', 'no-store');
+    res.status(204).end();
+});
+app.post('/api/auth/logout', requireSameOrigin, async (req, res) => {
+    destroyUiSession(req, res);
+    res.setHeader('Cache-Control', 'no-store');
+    res.status(204).end();
+});
 // GET /mod：可用插件列表（含 none）
 app.get('/mod', (req, res) => {
     const list = ['none', ...mods.keys()];
     res.json(list);
+});
+
+app.get('/api/ui/bootstrap', requireUiAuth, async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({
+        ...buildUiState(),
+        origins: await getOriginConfig(),
+        files: await getDownloadEntries()
+    });
+});
+
+app.get('/config.json', async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    res.status(404).type('text/plain; charset=utf-8').send('Not found');
+});
+
+app.get('/api/ui/state', requireUiAuth, (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    res.json(buildUiState());
+});
+
+app.get('/api/ui/files', requireUiAuth, async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    res.json(await getDownloadEntries());
 });
 
 // GET /log路径，可以直接获取日志
@@ -950,6 +1633,7 @@ const processTask = async (urlFragment, file = null, code, res, modName = null, 
     const useDefaultMgnacg = !requestedMod && (!isHttpUrl || isMgnacgUrl(urlFragment));
     const queueMode = Boolean(options.queueMode);
     const queueLabel = options.total > 1 ? ` [${options.index + 1}/${options.total}]` : '';
+    const compressionProfile = options.compressionProfile || RESOLUTION_PRESETS[API_DEFAULT_RESOLUTION];
 
     // 默认 mgnacg 编号路径 / mgnacg 完整 URL / 显式插件 / 直接打开页面
     let fullUrl;
@@ -1076,6 +1760,9 @@ const processTask = async (urlFragment, file = null, code, res, modName = null, 
         }
 
         const headers = downloadHeaders || buildBasicHeaders(refererUrl);
+        if (options.reportCompressionProfile || compressionProfile.id !== API_DEFAULT_RESOLUTION) {
+            updateStatus(`🎚 输出规格: ${compressionProfile.label}`);
+        }
 
         const isM3U8 = mediaUrl.toLowerCase().includes('.m3u8');
         serverState.currentTask = isM3U8 ? 'M3U8下载' : 'MP4下载';
@@ -1142,7 +1829,7 @@ const processTask = async (urlFragment, file = null, code, res, modName = null, 
             updateStatus(`✂️ 压缩时删除片段: ${cutRanges.map(formatCutRange).join(', ')}`);
         }
         updateStatus(null, `📦 压缩中...`);
-        await compressVideo(downloadPath, outPath, cutRanges, serverState, updateStatus);
+        await compressVideo(downloadPath, outPath, cutRanges, compressionProfile, serverState, updateStatus);
 
         if (pageTitle) {
             updateStatus(`✅ 任务完成: ${pageTitle}\n\n`);
@@ -1173,7 +1860,7 @@ const processTask = async (urlFragment, file = null, code, res, modName = null, 
     return true;
 };
 
-const processTaskQueue = async (urls, file = null, code, res, modName = null) => {
+const processTaskQueue = async (urls, file = null, code, res, modName = null, options = {}) => {
     const total = urls.length;
     serverState.queue = { items: urls, currentIndex: 0 };
     serverState.res = res;
@@ -1208,7 +1895,13 @@ const processTaskQueue = async (urls, file = null, code, res, modName = null) =>
                 code,
                 res,
                 modName,
-                { queueMode: true, index: i, total, attachResponseClose: false }
+                {
+                    ...options,
+                    queueMode: true,
+                    index: i,
+                    total,
+                    attachResponseClose: false
+                }
             );
         }
 
@@ -1221,6 +1914,45 @@ const processTaskQueue = async (urls, file = null, code, res, modName = null) =>
         }
     }
 };
+
+// === API 路由器（带鉴权，供前端使用） ===
+app.use('/api', createApiRouter({
+    // ── 中间件 ──
+    requireUiAuth,
+    requireSameOrigin,
+
+    // ── 核心任务函数 ──
+    processTask,
+    processTaskQueue,
+    killAndReset,
+    forceCleanFiles,
+    releaseVideoTaskLock,
+
+    // ── 共享状态 ──
+    serverState,
+    videoTaskLock,
+    mods,
+    logBuffer,
+
+    // ── 辅助函数 ──
+    splitTaskUrls,
+    splitTaskFiles,
+    sanitizeModName,
+    getCompressionProfile,
+    getQueueStatusLine,
+    getVideoTaskLockStatusLine,
+    getDownloadEntries,
+    shortenText,
+
+    // ── 常量 ──
+    RESOLUTION_PRESETS,
+    API_DEFAULT_RESOLUTION,
+    OUT_DIR,
+
+    // ── 模块 ──
+    fs,
+    path
+}));
 
 // === 路由入口 ===
 app.post('/', async (req, res) => {
@@ -1342,8 +2074,11 @@ app.post('/', async (req, res) => {
         const taskFiles = splitTaskFiles(body.file);
         // 可选 mod：插件文件名（不含 .js）；指定后 url 会原样传给插件 download()
         let modField = null;
+        let compressionProfile = RESOLUTION_PRESETS[API_DEFAULT_RESOLUTION];
+        const reportCompressionProfile = body.resolution != null && String(body.resolution).trim() !== '';
         try {
             modField = body.mod ? sanitizeModName(body.mod) : null;
+            compressionProfile = getCompressionProfile(body.resolution, API_DEFAULT_RESOLUTION);
         } catch (e) {
             res.write(JSON.stringify({ type: "error", error: e.message || String(e) }) + '\n');
             res.end(); return;
@@ -1374,9 +2109,15 @@ app.post('/', async (req, res) => {
         const runTask = async () => {
             try {
                 if (taskUrls.length > 1) {
-                    await processTaskQueue(taskUrls, taskFiles, taskCode, res, modField);
+                    await processTaskQueue(taskUrls, taskFiles, taskCode, res, modField, {
+                        compressionProfile,
+                        reportCompressionProfile
+                    });
                 } else {
-                    await processTask(taskUrls[0], taskFiles[0] || null, taskCode, res, modField);
+                    await processTask(taskUrls[0], taskFiles[0] || null, taskCode, res, modField, {
+                        compressionProfile,
+                        reportCompressionProfile
+                    });
                 }
             } catch (e) {
                 console.error('[Task Runner Error]', e?.stack || e?.message || e);
