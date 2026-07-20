@@ -49,6 +49,38 @@ const sanitizeModName = (name) => {
     return n;
 };
 
+/** 任务输出文件名（不含扩展名）：禁止路径分隔与穿越 */
+const sanitizeTaskFileBase = (value) => {
+    const raw = String(value ?? '').trim();
+    if (!raw) {
+        throw new Error('文件名不能为空');
+    }
+    if (
+        raw.includes('/')
+        || raw.includes('\\')
+        || raw.includes('\0')
+        || raw === '.'
+        || raw === '..'
+        || raw.includes('..')
+    ) {
+        throw new Error(`非法文件名: ${value}`);
+    }
+    const base = raw.replace(/\.mp4$/i, '');
+    if (!base || !/^[a-zA-Z0-9._-]+$/.test(base)) {
+        throw new Error(`非法文件名: ${value}`);
+    }
+    return base;
+};
+
+const resolveInsideDir = (baseDir, fileName) => {
+    const resolvedBase = path.resolve(baseDir);
+    const resolvedTarget = path.resolve(baseDir, fileName);
+    if (resolvedTarget !== resolvedBase && !resolvedTarget.startsWith(resolvedBase + path.sep)) {
+        throw new Error(`非法输出路径: ${fileName}`);
+    }
+    return resolvedTarget;
+};
+
 const loadMods = () => {
     mods.clear();
     if (!fs.existsSync(MOD_DIR)) {
@@ -161,7 +193,9 @@ const splitTaskFiles = (value) => {
     if (value == null || value === '') return [];
     return String(value)
         .split(',')
-        .map((item) => item.trim());
+        .map((item) => item.trim())
+        .filter(Boolean)
+        .map((item) => sanitizeTaskFileBase(item));
 };
 
 const isMgnacgUrl = (value) => {
@@ -919,6 +953,40 @@ const requireUiAuth = async (req, res, next) => {
     next();
 };
 
+/** POST / 兼容协议：Authorization: Bearer <明文口令>，与 config 中 passwordHash/password 校验 */
+const getBearerToken = (req) => {
+    const header = String(req.get('authorization') || '').trim();
+    const match = header.match(/^Bearer\s+(.+)$/i);
+    if (!match) return '';
+    return match[1].trim();
+};
+
+const requireBearerAuth = async (req, res, next) => {
+    const authConfig = await getUiAuthConfig();
+    if (!authConfig.configured) {
+        sendJsonError(res, 503, 'AUTH_NOT_CONFIGURED', '服务端未配置访问密码');
+        return;
+    }
+
+    const token = getBearerToken(req);
+    if (!token) {
+        sendJsonError(res, 401, 'AUTH_REQUIRED', '需要 Authorization: Bearer 令牌');
+        return;
+    }
+
+    const verified = await verifyUiPassword(token, authConfig);
+    if (!verified) {
+        sendJsonError(res, 401, 'AUTH_INVALID', '令牌无效');
+        return;
+    }
+
+    req.auth = {
+        bearer: true,
+        settings: authConfig
+    };
+    next();
+};
+
 const getUiPageAuthState = async (req, res) => {
     const authConfig = await getUiAuthConfig();
     const session = authConfig.configured ? getUiSession(req) : null;
@@ -1263,7 +1331,20 @@ app.use((req, res, next) => {
 app.use(express.json({ limit: '256kb' }));
 app.use(express.text({ type: '*/*', limit: '256kb' })); // 允许解析所有类型的文本输入
 app.use(express.urlencoded({ extended: true, limit: '256kb' }));
-app.use('/ui', express.static(PUBLIC_DIR));
+// /ui/*.js 需登录（login.js / styles.css 供登录页匿名访问）
+const UI_PUBLIC_ASSETS = new Set(['login.js', 'styles.css']);
+app.use('/ui', async (req, res, next) => {
+    const base = path.basename(req.path || '');
+    if (UI_PUBLIC_ASSETS.has(base)) {
+        next();
+        return;
+    }
+    if (base.endsWith('.js')) {
+        await requireUiAuth(req, res, next);
+        return;
+    }
+    next();
+}, express.static(PUBLIC_DIR));
 app.use('/dl', express.static(OUT_DIR, {
     setHeaders(res) {
         res.setHeader('Cache-Control', 'private, no-store');
@@ -1656,15 +1737,15 @@ const processTask = async (urlFragment, file = null, code, res, modName = null, 
                 fileName = `${code}_video.mp4`;
             }
         } else {
-            const safe = String(urlFragment).replace(/[^a-z0-9._-]/gi, '_');
+            const safe = String(urlFragment).replace(/[^a-z0-9._-]/gi, '_').replace(/\.\.+/g, '_');
             fileName = `${safe || code}.mp4`;
         }
     } else {
-        fileName = `${file}.mp4`;
+        fileName = `${sanitizeTaskFileBase(file)}.mp4`;
     }
 
-    const downloadPath = path.join(ROOT_DIR, fileName);
-    const outPath = path.join(OUT_DIR, fileName);
+    const downloadPath = resolveInsideDir(ROOT_DIR, fileName);
+    const outPath = resolveInsideDir(OUT_DIR, fileName);
     serverState.res = res;
     if (options.attachResponseClose !== false) res.on('close', () => {
         if (serverState.res === res) {
@@ -1954,8 +2035,7 @@ app.use('/api', createApiRouter({
     path
 }));
 
-// === 路由入口 ===
-app.post('/', async (req, res) => {
+app.post('/', requireBearerAuth, async (req, res) => {
     // 1. 安全获取 body，防止 undefined 导致崩溃
     const body = req.body || {};
     

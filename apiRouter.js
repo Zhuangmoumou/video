@@ -137,12 +137,12 @@ module.exports = function createApiRouter(deps) {
             return;
         }
 
-        const taskFiles = splitTaskFiles(body.file);
-
-        // ── 解析 mod 和 resolution ──
+        // ── 解析 file / mod / resolution ──
+        let taskFiles = [];
         let modField = null;
         let compressionProfile = RESOLUTION_PRESETS[API_DEFAULT_RESOLUTION];
         try {
+            taskFiles = splitTaskFiles(body.file);
             modField = body.mod ? sanitizeModName(body.mod) : null;
             compressionProfile = getCompressionProfile(body.resolution, API_DEFAULT_RESOLUTION);
         } catch (e) {
