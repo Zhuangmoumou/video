@@ -1,31 +1,28 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="zh-CN">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
     <meta name="description" content="Video Console 登录页">
-    <title>Video Console Login</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <title>登录 · Video Console</title>
     <link rel="stylesheet" href="/ui/styles.css">
     <script defer src="/ui/login.js"></script>
 </head>
 <body class="login-page">
-    <main class="page-shell login-shell">
-        <section class="login-card-simple">
-            <div class="login-card-copy">
-                <div class="brand">Video Console</div>
-                <p class="subtitle">输入访问密码进入控制台</p>
-            </div>
+    <main class="login-shell">
+        <section class="login-box" aria-labelledby="login-title">
+            <header class="login-heading">
+                <h1 id="login-title">Video Console</h1>
+                <p>输入访问密码</p>
+            </header>
 
             <form id="auth-form" class="auth-form">
                 <label class="field">
-                    <span>访问密码</span>
-                    <input id="auth-password" type="password" autocomplete="current-password" placeholder="输入后进入控制台">
+                    <span>密码</span>
+                    <input id="auth-password" type="password" autocomplete="current-password" placeholder="访问密码">
                 </label>
-                <button id="auth-submit" class="primary auth-submit" type="submit">进入控制台</button>
-                <p id="auth-feedback" class="auth-feedback" data-tone="muted">正在检查访问权限...</p>
+                <button id="auth-submit" class="button button-primary auth-submit" type="submit">登录</button>
+                <p id="auth-feedback" class="auth-feedback" data-tone="muted" aria-live="polite">正在检查访问权限...</p>
             </form>
         </section>
     </main>

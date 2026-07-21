@@ -17,6 +17,7 @@
 
 const crypto = require('crypto');
 const axios = require('axios');
+const { parseSafeObjectLiteral } = require('../src/utils/objectLiteral');
 
 const SITE = 'https://mgnacg.com';
 const DEFAULT_UA =
@@ -82,15 +83,12 @@ function extractPlayerAaaa(html) {
     const m = html.match(/var\s+player_aaaa\s*=\s*(\{[\s\S]*?})\s*;?\s*<\/script>/i);
     if (!m) throw new Error('页面中未找到 player_aaaa，可能被拦截或页面结构变更');
     try {
-        // player_aaaa 是 JSON 兼容对象字面量
         return JSON.parse(m[1]);
     } catch (e) {
-        // 兜底：用 Function 解析（仅用于受控站点 HTML）
         try {
-            // eslint-disable-next-line no-new-func
-            return new Function(`return (${m[1]})`)();
+            return parseSafeObjectLiteral(m[1]);
         } catch (e2) {
-            throw new Error('player_aaaa 解析失败: ' + e.message);
+            throw new Error('player_aaaa 解析失败: ' + e2.message);
         }
     }
 }

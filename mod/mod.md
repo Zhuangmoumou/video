@@ -30,7 +30,7 @@
 ```js
 /**
  * @param {string} input  任务请求里的 url 字段原样传入
- * @param {object} [options]  可选；当前主程序默认不传，可预留扩展
+ * @param {object} [options]  可选；当前主程序传入 `{ meta: true }`
  * @returns {Promise<string|object>|string|object}
  */
 async function download(input, options = {}) {
@@ -79,7 +79,7 @@ return {
 
 | 字段 | 必填 | 说明 |
 |------|------|------|
-| `url` 或 `mediaUrl` | 是 | 最终可下载的媒体地址（mp4 / m3u8 等） |
+| `url` 或 `mediaUrl` | 是 | 最终可下载的媒体地址（mp4 / m3u8 等）；内置插件也可返回绝对路径的本地 m3u8 |
 | `pageUrl` / `referer` / `refererUrl` | 否 | 下载时的 Referer/Origin 来源页 |
 | `cutRanges` | 否 | 压缩时删除的片段数组，如 `[{ "start": 364, "end": 384 }]`；也支持 `MM:SS` / `HH:MM:SS` 字符串 |
 
@@ -89,7 +89,7 @@ return {
 
 - 请 **`throw new Error('可读原因')`**
 - 不要返回 `null` / `undefined` / 空字符串
-- 返回的媒体地址若不是 `http(s)`，主程序会报错并中止任务
+- 返回的媒体地址若不是 `http(s)` 或绝对路径的本地 m3u8，主程序会报错并中止任务
 
 ---
 
@@ -251,16 +251,19 @@ node mod/mgnacg.js 1619-3-2
 
 # 启动主服务后发任务
 curl -N -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer TOKEN' \
   -d '{"url":"1619-3-2","code":1}' \
   http://127.0.0.1:9898/
 
 # 指定插件
 curl -N -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer TOKEN' \
   -d '{"url":"1619-3-2","code":1,"mod":"mgnacg"}' \
   http://127.0.0.1:9898/
 
 # 指定 danzhu 插件，可传完整 URL 或编号
 curl -N -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer TOKEN' \
   -d '{"url":"6477-1-1","code":1,"mod":"danzhu"}' \
   http://127.0.0.1:9898/
 ```
@@ -279,7 +282,7 @@ curl -N -H 'Content-Type: application/json' \
 | 插件 | 文件 | 说明 |
 |------|------|------|
 | `mgnacg` | `mod/mgnacg.js` | 解析 mgnacg 选集编号为媒体直链；默认编号任务会优先调用 |
-| `danzhu` | `mod/danzhu.js` | 解析 dm.danzhuacg.com 播放页/编号为 m3u8，并返回 `cutRanges` 让压缩阶段删除 06:04-06:24 |
+| `danzhu` | `mod/danzhu.js` | 解析 dm.danzhuacg.com 播放页/编号为 m3u8，并在 playlist 层剔除广告分片 |
 | `sorani` | `mod/sorani.js` | 解析 www.sorani.net 番剧编号/URL 为 AES-128 m3u8 直链（需带站点 Referer） |
 
 参考实现与线路说明见 `mgnacg.js` 文件头注释。

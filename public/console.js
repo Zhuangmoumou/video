@@ -18,7 +18,8 @@ const state = {
     streamText: '正在初始化...',
     streamLock: false,
     timer: null,
-    lastServerLogText: ''
+    lastServerLogText: '',
+    logHoldUntil: 0
 };
 
 const els = {
@@ -29,19 +30,39 @@ const els = {
     regenCode: document.getElementById('regen-code'),
     taskForm: document.getElementById('task-form'),
     originSelect: document.getElementById('origin-select'),
+    originField: document.querySelector('.origin-field'),
     inputText: document.getElementById('input-text'),
     fileInput: document.getElementById('file-input'),
     modSelect: document.getElementById('mod-select'),
     resolutionSelect: document.getElementById('resolution-select'),
     sourcePreview: document.getElementById('source-preview'),
+    sourceField: document.querySelector('.source-field'),
     stopBtn: document.getElementById('stop-btn'),
-    clearBtn: document.getElementById('clear-btn'),
+    clearLogBtn: document.getElementById('clear-log-btn'),
+    clearOutputBtn: document.getElementById('clear-output-btn'),
     refreshState: document.getElementById('refresh-state'),
     refreshFiles: document.getElementById('refresh-files'),
     logView: document.getElementById('log-view'),
     fileList: document.getElementById('file-list'),
-    templateList: document.getElementById('template-list')
+    templateList: document.getElementById('template-list'),
+    templatesSection: document.querySelector('.templates-section')
 };
+
+function isPluginMode() {
+    const mod = els.modSelect.value;
+    return Boolean(mod && mod !== 'none');
+}
+
+function syncTemplateMode() {
+    const pluginMode = isPluginMode();
+    document.body.classList.toggle('plugin-mode', pluginMode);
+    els.originField.hidden = pluginMode;
+    els.sourceField.hidden = pluginMode;
+    els.templatesSection.hidden = pluginMode;
+    els.originSelect.disabled = pluginMode || state.streamLock;
+    if (pluginMode) els.sourcePreview.value = '';
+    else renderTemplatePreview();
+}
 
 function esc(value) {
     return String(value ?? '')
@@ -53,8 +74,15 @@ function esc(value) {
 }
 
 function setLog(text) {
+    const distanceFromBottom = els.logView.scrollHeight - els.logView.scrollTop - els.logView.clientHeight;
+    const followLatest = state.streamLock || Date.now() < state.logHoldUntil || distanceFromBottom < 48;
     state.streamText = text || '等待提交...';
     els.logView.textContent = state.streamText;
+    if (followLatest) {
+        requestAnimationFrame(() => {
+            els.logView.scrollTop = els.logView.scrollHeight;
+        });
+    }
 }
 
 function appendLog(text) {
@@ -121,6 +149,10 @@ function renderOrigins(list = []) {
 }
 
 function renderTemplatePreview() {
+    if (isPluginMode()) {
+        els.sourcePreview.value = '';
+        return;
+    }
     const item = state.originConfig[Number(state.selectedOrigin)] || state.originConfig[0];
     if (!item) {
         els.sourcePreview.value = '';
@@ -138,6 +170,7 @@ function renderMods(mods = ['none']) {
         : (state.mods.includes('none') ? 'none' : state.mods[0]);
     els.modSelect.innerHTML = state.mods.map((mod) => `<option value="${esc(mod)}">${esc(mod)}</option>`).join('');
     els.modSelect.value = nextSelected || 'none';
+    syncTemplateMode();
 }
 
 function renderResolutions(resolutions = []) {
@@ -171,7 +204,7 @@ function renderFiles(files = []) {
     els.fileList.innerHTML = files.map((file) => `
         <div class="item">
             <strong>${esc(file.name)}</strong>
-            <span>${esc(file.sizeText)} · ${esc(file.modifiedAt)}</span>
+            <span>${esc(file.sizeText)} · ${esc(file.modifiedAtText || file.modifiedAt)}</span>
             <a href="${esc(file.href)}" target="_blank" rel="noreferrer">打开</a>
         </div>
     `).join('');
@@ -197,7 +230,7 @@ function renderState(data = {}) {
     els.taskId.textContent = `#${String(data.code || els.taskId.textContent.replace('#', '') || buildCode())}`;
     if (Array.isArray(data.logs) && data.logs.length) {
         state.lastServerLogText = data.logs.join('\n');
-        if (!state.streamLock) {
+        if (!state.streamLock && Date.now() >= state.logHoldUntil) {
             setLog(state.lastServerLogText);
         }
     }
@@ -302,10 +335,12 @@ function handleStreamMessage(message) {
         return;
     }
     if (message.type === 'stop') {
+        state.logHoldUntil = Date.now() + 5000;
         appendLog(`任务已停止:\n${formatJsonBlock(message.stop)}`);
         return;
     }
     if (message.type === 'rm') {
+        state.logHoldUntil = Date.now() + 5000;
         appendLog(`任务已停止并清理:\n${formatJsonBlock(message.stop)}\n\n已删除:\n${formatJsonBlock(message.del)}`);
         return;
     }
@@ -317,29 +352,32 @@ function handleStreamMessage(message) {
 function lockForm(locked) {
     state.streamLock = locked;
     els.taskForm.querySelectorAll('input, select, textarea, button').forEach((el) => {
-        if (el === els.refreshState || el === els.refreshFiles || el === els.clearBtn) return;
         el.disabled = locked && el !== els.stopBtn;
     });
     els.stopBtn.disabled = false;
+    els.clearLogBtn.disabled = false;
+    els.clearOutputBtn.disabled = false;
+    syncTemplateMode();
 }
 
 function collectPayload() {
-    const origin = state.originConfig[Number(state.selectedOrigin)] || state.originConfig[0];
-    if (!origin) {
-        throw new Error('未加载来源配置');
-    }
-
     const rawInput = els.inputText.value.trim();
-    const parts = readConfigSourceParts(rawInput);
-    const input = applyTemplate(origin.url || '{1}', parts);
+    if (!rawInput) throw new Error('请输入编号或链接');
+    const mod = els.modSelect.value;
+    let input = rawInput;
+    if (!mod || mod === 'none') {
+        const origin = state.originConfig[Number(state.selectedOrigin)] || state.originConfig[0];
+        if (!origin) throw new Error('未加载来源配置');
+        input = applyTemplate(origin.url || '{1}', readConfigSourceParts(rawInput));
+    }
+    const displayedCode = Number(els.taskId.textContent.replace(/^#/, ''));
     const payload = {
         url: input,
-        code: Number(buildCode()),
+        code: Number.isSafeInteger(displayedCode) && displayedCode > 0 ? displayedCode : Number(buildCode()),
         resolution: state.selectedResolution
     };
 
     const file = els.fileInput.value.trim();
-    const mod = els.modSelect.value;
     const autoFile = buildAutoFileField(rawInput);
     if (file) {
         payload.file = file;
@@ -462,6 +500,7 @@ function bindEvents() {
         renderTemplatePreview();
     });
     els.inputText.addEventListener('input', renderTemplatePreview);
+    els.modSelect.addEventListener('change', syncTemplateMode);
     els.resolutionSelect.addEventListener('change', () => {
         state.selectedResolution = els.resolutionSelect.value;
         els.apiStatus.textContent = state.selectedResolution === 'api-default'
@@ -473,9 +512,9 @@ function bindEvents() {
     });
     els.taskForm.addEventListener('submit', onSubmit);
     els.stopBtn.addEventListener('click', async () => {
+        let result = null;
         try {
-            const result = await requestJson('/api/task/stop', { method: 'POST' });
-            handleStreamMessage(result);
+            result = await requestJson('/api/task/stop', { method: 'POST' });
         } catch (error) {
             if (!handleProtectedError(error)) {
                 appendLog(`错误: ${error.message || error}`);
@@ -487,10 +526,28 @@ function bindEvents() {
                     appendLog(`错误: ${error.message || error}`);
                 }
             });
+            if (result) handleStreamMessage(result);
         }
     });
-    els.clearBtn.addEventListener('click', () => {
-        setLog('等待提交...');
+    els.clearLogBtn.addEventListener('click', async () => {
+        try {
+            await requestNoContent('/api/ui/log/clear', { method: 'POST' });
+            state.lastServerLogText = '';
+            setLog('日志已清空。');
+        } catch (error) {
+            if (!handleProtectedError(error)) appendLog(`错误: ${error.message || error}`);
+        }
+    });
+    els.clearOutputBtn.addEventListener('click', async () => {
+        try {
+            const result = await requestJson('/api/task/clean', { method: 'POST' });
+            handleStreamMessage(result);
+            renderFiles(await requestJson('/api/ui/files'));
+        } catch (error) {
+            if (!handleProtectedError(error)) appendLog(`错误: ${error.message || error}`);
+        } finally {
+            lockForm(false);
+        }
     });
     els.refreshState.addEventListener('click', async () => {
         try {

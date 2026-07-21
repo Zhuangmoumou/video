@@ -2,7 +2,7 @@
  * apiRouter.js — 带鉴权的 /api/task/* 端点
  *
  * 前端 console.js 通过此路由器间接操作下载任务，不再直接暴露 POST / 的协议。
- * POST / 保持不变以兼容旧客户端（无需鉴权）。
+ * POST / 保持为独立兼容协议，供旧客户端和简单 API 对接使用。
  */
 
 const express = require('express');
@@ -22,13 +22,13 @@ module.exports = function createApiRouter(deps) {
         processTaskQueue,
         killAndReset,
         forceCleanFiles,
-        releaseVideoTaskLock,
+        taskManager,
 
         // ── 共享状态（对象/Map/数组 引用传递） ──
         serverState,
         videoTaskLock,
         mods,
-        logBuffer,
+        logStore,
 
         // ── 辅助函数 ──
         splitTaskUrls,
@@ -56,38 +56,7 @@ module.exports = function createApiRouter(deps) {
     // 所有 /api/task/* 路由统一鉴权
     // ──────────────────────────────────────────────
 
-    /**
-     * requireUiAuth 内部会调用 sendRequestError，后者通过
-     * req.path.startsWith('/api/') 判断是否返回 JSON 错误。
-     *
-     * 由于本 Router 挂载在 /api 下，内部 req.path 是相对路径
-     *（如 /task、/task/stop），不会命中 startsWith('/api/')。
-     *
-     * 对于 POST 请求，sendRequestError 走 req.method !== 'GET'
-     * 分支仍然返回 JSON；对于 GET 请求，我们预先补全 req.path
-     * 以确保错误响应始终为 JSON 格式。
-     */
-    router.use(async (req, res, next) => {
-        const saved = req.path;
-        // sendRequestError 检查 req.path.startsWith('/api/')
-        // Router 内部 req.path 是相对路径，需要补全
-        if (!saved.startsWith('/api/')) {
-            req.path = `${req.baseUrl}${saved}`;
-        }
-        let authDone = false;
-
-        // requireUiAuth 是 async 函数，必须 await
-        await requireUiAuth(req, res, (err) => {
-            authDone = true;
-            req.path = saved;
-            next(err);
-        });
-
-        // auth 失败时 requireUiAuth 不会调用 next()，恢复 req.path
-        if (!authDone) {
-            req.path = saved;
-        }
-    });
+    router.use(requireUiAuth);
 
     router.use(requireSameOrigin);
 
@@ -101,6 +70,8 @@ module.exports = function createApiRouter(deps) {
         res.setHeader('Content-Type', 'application/json; charset=utf-8');
         res.setHeader('Transfer-Encoding', 'chunked');
         res.setHeader('Cache-Control', 'no-store');
+        res.setHeader('X-Accel-Buffering', 'no');
+        res.flushHeaders();
 
         // ── 参数校验 ──
         if (!body.url || !body.code) {
@@ -197,10 +168,12 @@ module.exports = function createApiRouter(deps) {
             } catch (e) {
                 console.error('[ApiRouter Task Error]', e?.stack || e?.message || e);
             } finally {
-                releaseVideoTaskLock(taskLockToken);
+                // taskManager owns lock release after the complete task promise settles.
             }
         };
-        runTask();
+        taskManager.launch(taskLockToken, runTask).catch((error) => {
+            console.error('[ApiRouter Task Runner Error]', error?.stack || error);
+        });
     });
 
     // ──────────────────────────────────────────────
@@ -265,7 +238,7 @@ module.exports = function createApiRouter(deps) {
             `锁: ${lockStatus || '无'}`,
             `队列: ${queueStatus || '无'}`,
             '\n=== 最近日志 ===',
-            ...logBuffer
+            ...logStore.list()
         ].join('\n');
 
         await fs.writeFile(path.join(OUT_DIR, 'log.txt'), logContent);

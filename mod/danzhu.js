@@ -16,6 +16,7 @@ const { spawnSync } = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { parseSafeObjectLiteral } = require('../src/utils/objectLiteral');
 
 const SITE = 'https://dm.danzhuacg.com';
 const HOST = 'dm.danzhuacg.com';
@@ -130,11 +131,9 @@ function parsePlayerAaaa(html) {
         return JSON.parse(literal);
     } catch (jsonError) {
         try {
-            // player_aaaa is a site-controlled object literal.
-            // eslint-disable-next-line no-new-func
-            return new Function(`return (${literal})`)();
+            return parseSafeObjectLiteral(literal);
         } catch (fnError) {
-            throw new Error(`player_aaaa 解析失败: ${jsonError.message}`);
+            throw new Error(`player_aaaa 解析失败: ${fnError.message}`);
         }
     }
 }

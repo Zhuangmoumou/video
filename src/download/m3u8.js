@@ -4,7 +4,7 @@ const fs = require('fs-extra');
 const path = require('path');
 const { URL } = require('url');
 const { spawn } = require('child_process');
-const { createProgressLimiter, createSpeedAverager } = require('./progressLimiter');
+const { createProgressLimiter, createSpeedAverager } = require('../utils/progress');
 
 const proxyDomain = (process.env.PROXY_DOMAIN || '').trim();
 

@@ -68,7 +68,7 @@ jobs:
           # 运行 Node.js 应用
           # 如果 app.js 是一个 Web 服务器，它将保持运行直到 Action 超时
         run: |
-          node app.js &
+          pnpm start &
           APP_PID=$!
           echo "应用程序启动 PID: $APP_PID"
         
