@@ -11,6 +11,7 @@ const DEFAULT_LOGIN_MAX_ATTEMPTS = 5;
 function createAuthService() {
     const authSessions = new Map();
     const authLoginAttempts = new Map();
+    const authBearerAttempts = new Map();
 const firstFilledValue = (...values) => {
     for (const value of values) {
         const text = typeof value === 'string' ? value.trim() : value;
@@ -124,16 +125,16 @@ const cleanupExpiredSessions = () => {
     }
 };
 
-const cleanupExpiredLoginAttempts = (authConfig) => {
+const cleanupExpiredAttempts = (store, authConfig) => {
     const now = Date.now();
     const maxAge = Math.max(authConfig.loginWindowMs, authConfig.loginBlockMs);
-    for (const [key, entry] of authLoginAttempts.entries()) {
+    for (const [key, entry] of store.entries()) {
         if (!entry || (entry.blockedUntil && entry.blockedUntil <= now && now - entry.windowStartedAt > maxAge)) {
-            authLoginAttempts.delete(key);
+            store.delete(key);
             continue;
         }
         if (!entry.blockedUntil && now - entry.windowStartedAt > authConfig.loginWindowMs) {
-            authLoginAttempts.delete(key);
+            store.delete(key);
         }
     }
 };
@@ -213,10 +214,10 @@ const destroyUiSession = (req, res) => {
 
 const getLoginAttemptKey = (req) => req.socket?.remoteAddress || 'unknown';
 
-const getLoginAttemptState = (req, authConfig) => {
-    cleanupExpiredLoginAttempts(authConfig);
+const getAttemptState = (store, req, authConfig) => {
+    cleanupExpiredAttempts(store, authConfig);
     const key = getLoginAttemptKey(req);
-    const entry = authLoginAttempts.get(key);
+    const entry = store.get(key);
     if (!entry) {
         return {
             blocked: false,
@@ -235,7 +236,7 @@ const getLoginAttemptState = (req, authConfig) => {
     }
 
     if (now - entry.windowStartedAt > authConfig.loginWindowMs) {
-        authLoginAttempts.delete(key);
+        store.delete(key);
         return {
             blocked: false,
             remaining: authConfig.loginMaxAttempts,
@@ -250,11 +251,11 @@ const getLoginAttemptState = (req, authConfig) => {
     };
 };
 
-const recordFailedLogin = (req, authConfig) => {
-    cleanupExpiredLoginAttempts(authConfig);
+const recordFailedAttempt = (store, req, authConfig) => {
+    cleanupExpiredAttempts(store, authConfig);
     const key = getLoginAttemptKey(req);
     const now = Date.now();
-    const current = authLoginAttempts.get(key);
+    const current = store.get(key);
     const isNewWindow = !current || now - current.windowStartedAt > authConfig.loginWindowMs;
     const next = isNewWindow
         ? { count: 1, windowStartedAt: now, blockedUntil: null }
@@ -264,7 +265,7 @@ const recordFailedLogin = (req, authConfig) => {
         next.blockedUntil = now + authConfig.loginBlockMs;
     }
 
-    authLoginAttempts.set(key, next);
+    store.set(key, next);
     return {
         blocked: Boolean(next.blockedUntil && next.blockedUntil > now),
         remaining: Math.max(authConfig.loginMaxAttempts - next.count, 0),
@@ -272,8 +273,24 @@ const recordFailedLogin = (req, authConfig) => {
     };
 };
 
+const getLoginAttemptState = (req, authConfig) => getAttemptState(authLoginAttempts, req, authConfig);
+
+const recordFailedLogin = (req, authConfig) => recordFailedAttempt(authLoginAttempts, req, authConfig);
+
 const clearLoginAttempts = (req) => {
     authLoginAttempts.delete(getLoginAttemptKey(req));
+};
+
+const getBearerAttemptState = (req, authConfig) => {
+    return getAttemptState(authBearerAttempts, req, authConfig);
+};
+
+const recordFailedBearerAuth = (req, authConfig) => {
+    return recordFailedAttempt(authBearerAttempts, req, authConfig);
+};
+
+const clearBearerAttempts = (req) => {
+    authBearerAttempts.delete(getLoginAttemptKey(req));
 };
 
 const sendJsonError = (res, status, code, error) => {
@@ -360,17 +377,41 @@ const requireBearerAuth = async (req, res, next) => {
         return;
     }
 
+    const sendBearerRateLimit = (attemptState) => {
+        const seconds = Math.max(1, Math.ceil(attemptState.retryAfterMs / 1000));
+        res.setHeader('Retry-After', String(seconds));
+        sendJsonError(res, 429, 'AUTH_RATE_LIMITED', `尝试过多，请在 ${seconds} 秒后再试`);
+    };
+
+    const attemptState = getBearerAttemptState(req, authConfig);
+    if (attemptState.blocked) {
+        sendBearerRateLimit(attemptState);
+        return;
+    }
+
     const token = getBearerToken(req);
     if (!token) {
+        const nextState = recordFailedBearerAuth(req, authConfig);
+        if (nextState.blocked) {
+            sendBearerRateLimit(nextState);
+            return;
+        }
         sendJsonError(res, 401, 'AUTH_REQUIRED', '需要 Authorization: Bearer 令牌');
         return;
     }
 
     const verified = await verifyUiPassword(token, authConfig);
     if (!verified) {
+        const nextState = recordFailedBearerAuth(req, authConfig);
+        if (nextState.blocked) {
+            sendBearerRateLimit(nextState);
+            return;
+        }
         sendJsonError(res, 401, 'AUTH_INVALID', '令牌无效');
         return;
     }
+
+    clearBearerAttempts(req);
 
     req.auth = {
         bearer: true,
