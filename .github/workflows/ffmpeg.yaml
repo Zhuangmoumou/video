@@ -6,7 +6,7 @@ on:
   workflow_dispatch: # 允许手动触发
 
 jobs:
-  build-and-run:
+  run:
     runs-on: ubuntu-latest
 
     steps:
@@ -20,17 +20,10 @@ jobs:
         with:
           node-version: '24' # 你可以根据需要更改版本
 
-      # 3. 安装 FFmpeg
-      #- name: Install FFmpeg
-        #uses: federicocarboni/setup-ffmpeg@v3
-        #with:
-          #token: ${{ secrets.GITHUB_TOKEN }}
       - name: Install System Dependencies
         run: |
           sudo apt-get update
-          # 安装 ffmpeg 和 sensors (对应你代码里的 exec('sensors'))
           sudo apt-get install -y ffmpeg lm-sensors
-          # 检查 sensors 是否能跑（在虚拟机里可能返回空，但不会报错）
           sensors || true
 
       # 4. 安装 cloudflared
@@ -59,6 +52,11 @@ jobs:
         run: |
           # 以服务挂载后台启动 Cloudflare Tunnel
           sudo cloudflared service install $API_KEY
+
+      - name: Create config.json from secret
+        run: |
+          echo '${{ secrets.CONFIG_JSON }}' > config.json
+          echo "config.json 已创建"
 
       - name: Start App（开始运行）
         env:
