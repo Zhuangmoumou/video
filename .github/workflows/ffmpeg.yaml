@@ -37,13 +37,14 @@ jobs:
         run: |
           npm install -g pnpm
           pnpm install
+          pnpm exec npx playwright install chromium-headless-shell
 
       # 6. 安装系统 Chrome，避免 Playwright 下载和解压浏览器
-      - name: Install Google Chrome
-        run: |
-          wget -q -O google-chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
-          sudo apt-get install -y ./google-chrome.deb
-          google-chrome-stable --version
+#      - name: Install Google Chrome
+#        run: |
+#          wget -q -O google-chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+#          sudo apt-get install -y ./google-chrome.deb
+#          google-chrome-stable --version
 
       # 7. 启动隧道
       - name: Start Tunnel（开启隧道）
@@ -62,7 +63,7 @@ jobs:
         env:
           PROXY_DOMAIN: ${{ secrets.PROXY_DOMAIN }}
           DOWNLOAD_PROXY: ${{ secrets.DOWNLOAD_PROXY }}
-          PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH: /usr/bin/google-chrome-stable
+          #PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH: /usr/bin/google-chrome-stable
           # 运行 Node.js 应用
           # 如果 app.js 是一个 Web 服务器，它将保持运行直到 Action 超时
         run: |
