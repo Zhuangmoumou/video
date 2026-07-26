@@ -191,7 +191,7 @@ function renderResolutions(resolutions = []) {
         : (resolutions[0]?.id || 'api-default');
     state.selectedResolution = selected;
     els.resolutionSelect.value = selected;
-    els.apiStatus.textContent = selected === 'api-default' ? 'API 默认 320x170' : `网页分辨率 ${selected}`;
+    els.apiStatus.textContent = selected === 'api-default' ? 'API 默认 320x170' : `分辨率 ${selected}`;
 }
 
 function renderFiles(files = []) {
@@ -505,7 +505,7 @@ function bindEvents() {
         state.selectedResolution = els.resolutionSelect.value;
         els.apiStatus.textContent = state.selectedResolution === 'api-default'
             ? 'API 默认 320x170'
-            : `网页分辨率 ${state.selectedResolution}`;
+            : `分辨率 ${state.selectedResolution}`;
     });
     els.regenCode.addEventListener('click', () => {
         els.taskId.textContent = `#${buildCode()}`;

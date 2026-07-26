@@ -1,0 +1,15 @@
+{
+    "origin": [
+        {
+            "name": "xxx",
+            "url": "https://xxx.com/xxx/{1}-{2}-{3}"
+        },
+        {
+            "name": "yyy",
+            "url": "https://yyy.com/yyy/{1}-{2}-{3}.html"
+        }
+    ],
+    "auth": {
+        "passwordHash": ""
+    }
+}
