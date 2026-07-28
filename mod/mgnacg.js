@@ -195,6 +195,7 @@ function pickParseBase(player) {
  * @param {object} [options]
  * @param {string} [options.site] 站点根，默认 https://mgnacg.com
  * @param {boolean} [options.meta] 为 true 时返回详情对象，否则只返回 url 字符串
+ * @param {AbortSignal} [options.signal] 任务中止信号（主程序 stop 时传入）
  * @returns {Promise<string|object>}
  */
 async function download(episodeId, options = {}) {
@@ -202,9 +203,16 @@ async function download(episodeId, options = {}) {
     const info = parseEpisodeId(id);
     const site = (options.site || SITE).replace(/\/+$/, '');
     const pageUrl = `${site}/bangumi/${id}`;
+    const signal = options.signal;
+    if (signal?.aborted) {
+        const err = new Error('任务被中止');
+        err.name = 'AbortError';
+        throw err;
+    }
 
     // 1) 拉播放页
     const pageRes = await http.get(pageUrl, {
+        signal,
         headers: { Referer: site + '/' },
     });
     const pageHtml = typeof pageRes.data === 'string' ? pageRes.data : String(pageRes.data);
@@ -218,6 +226,7 @@ async function download(episodeId, options = {}) {
 
     // 2) 拉线路解析页
     const parseRes = await http.get(parseUrl, {
+        signal,
         headers: {
             Referer: pageUrl,
             Origin: site,
@@ -244,7 +253,6 @@ async function download(episodeId, options = {}) {
             from: player.from,
             pageUrl,
             pageTitle,
-            title: pageTitle,
             parseUrl,
             url: mediaUrl,
             player,

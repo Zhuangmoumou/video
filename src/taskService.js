@@ -4,6 +4,7 @@ const { pipeline } = require('stream/promises');
 const { ROOT_DIR, OUT_DIR, API_DEFAULT_RESOLUTION, FRONTEND_DEFAULT_RESOLUTION, RESOLUTION_PRESETS, getUiResolutionOptions } = require('./config');
 const { sanitizeModName, sanitizeTaskFileBase, resolveInsideDir, splitTaskFiles } = require('./utils/validation');
 const { createProgressLimiter, createSpeedAverager } = require('./utils/progress');
+const { isAbortError, sleep: abortableSleep, throwIfAborted } = require('./utils/abort');
 const { downloadM3U8 } = require('./download/m3u8');
 const { downloadMp4WithRedirects, getAxiosProxyConfig, formatSpeed } = require('./download/mp4');
 const { compressVideo, formatCutRange } = require('./videoProcessor');
@@ -186,6 +187,7 @@ const processTask = async (urlFragment, file = null, code, res, modName = null, 
         if (requestedMod) {
             state.currentTask = `插件:${requestedMod}`;
             try {
+                throwIfAborted(state.abortController?.signal);
                 const resolved = await resolveByMod(requestedMod, urlFragment, updateStatus);
                 mediaUrl = resolved.mediaUrl;
                 refererUrl = resolved.refererUrl || refererUrl;
@@ -193,6 +195,7 @@ const processTask = async (urlFragment, file = null, code, res, modName = null, 
                 cutRanges = resolved.cutRanges || [];
                 downloadHeaders = buildBasicHeaders(refererUrl);
             } catch (e) {
+                if (isAbortError(e) || state.abortController?.signal?.aborted) throw e;
                 updateStatus(`❌ 插件 ${requestedMod} 解析失败: ${e.message || e}`);
                 throw e;
             }
@@ -201,6 +204,7 @@ const processTask = async (urlFragment, file = null, code, res, modName = null, 
             state.currentTask = '插件:mgnacg';
             if (mods.has('mgnacg')) {
                 try {
+                    throwIfAborted(state.abortController?.signal);
                     updateStatus('🔌 mgnacg 任务优先使用插件快速解析');
                     const resolved = await resolveByMod('mgnacg', urlFragment, updateStatus);
                     mediaUrl = resolved.mediaUrl;
@@ -209,6 +213,7 @@ const processTask = async (urlFragment, file = null, code, res, modName = null, 
                     cutRanges = resolved.cutRanges || [];
                     downloadHeaders = buildBasicHeaders(refererUrl);
                 } catch (e) {
+                    if (isAbortError(e) || state.abortController?.signal?.aborted) throw e;
                     updateStatus(`⚠️ 插件 mgnacg 解析失败，回退浏览器抓取: ${e.message || e}`);
                     mediaUrl = null;
                 }
@@ -264,12 +269,12 @@ const processTask = async (urlFragment, file = null, code, res, modName = null, 
         const isM3U8 = mediaUrl.toLowerCase().includes('.m3u8');
         state.currentTask = isM3U8 ? 'M3U8下载' : 'MP4下载';
         state.abortController ||= new AbortController();
-        if (state.abortController.signal.aborted) throw new Error('任务被中止');
+        throwIfAborted(state.abortController.signal);
 
-        // 下载前等待2秒
+        // 下载前等待2秒（可被停止打断）
         updateStatus(null, '⏳ 下载前等待 2 秒...');
-        await new Promise((resolve) => setTimeout(resolve, 2000));
-        if (state.abortController.signal.aborted) throw new Error('任务被中止');
+        await abortableSleep(2000, state.abortController.signal);
+        throwIfAborted(state.abortController.signal);
 
         if (isM3U8) {
             updateStatus(`📦 M3U8 模式...`);
@@ -339,7 +344,7 @@ const processTask = async (urlFragment, file = null, code, res, modName = null, 
             res.write(JSON.stringify(payload) + '\n');
         }
     } catch (error) {
-        const taskWasStopped = Boolean(state.abortController?.signal.aborted);
+        const taskWasStopped = Boolean(state.abortController?.signal.aborted) || isAbortError(error);
         if (taskWasStopped) {
             console.log(`[T ${code}] 任务已停止`);
             return false;

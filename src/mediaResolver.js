@@ -2,6 +2,7 @@ const { chromium } = require('playwright-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const { normalizeModResult } = require('./modLoader');
 const { parseSafeObjectLiteral } = require('./utils/objectLiteral');
+const { createAbortError, isAbortError, raceWithAbort, throwIfAborted } = require('./utils/abort');
 const { DEFAULT_UA, getPlaywrightProxyConfig } = require('./download/mp4');
 chromium.use(StealthPlugin());
 
@@ -28,12 +29,30 @@ const buildBasicHeaders = (refererUrl) => {
     return headers;
 };
 
+const getTaskSignal = () => serverState.abortController?.signal || null;
+
 const resolveByMod = async (modName, input, updateStatus) => {
     const mod = modLoader.get(modName);
+    const signal = getTaskSignal();
+    throwIfAborted(signal);
+
     updateStatus(`🔌 使用插件解析: ${mod.name}`);
     updateStatus(null, `🔌 插件 ${mod.name} 解析中...`);
     console.log(`[Mod] 调用 ${mod.name}.download(${JSON.stringify(String(input).slice(0, 120))})`);
-    const raw = await mod.download(input, { meta: true });
+
+    let raw;
+    try {
+        // 同时把 signal 传给插件，并用 race 兜底：即使旧插件不支持 signal，停止也能立刻打断等待
+        raw = await raceWithAbort(
+            Promise.resolve().then(() => mod.download(input, { meta: true, signal })),
+            signal
+        );
+    } catch (error) {
+        if (signal?.aborted || isAbortError(error)) throw createAbortError();
+        throw error;
+    }
+
+    throwIfAborted(signal);
     const parsed = normalizeModResult(raw);
     if (parsed.pageTitle) {
         updateStatus(`📄 页面标题: ${parsed.pageTitle}`);
@@ -78,8 +97,8 @@ const isMediaResponse = (response) => {
 const resolveMediaByBrowser = async (fullUrl, updateStatus) => {
     serverState.currentTask = '浏览器解析';
     updateStatus(null, "🌏 等待浏览器启动");
-    const taskSignal = serverState.abortController?.signal;
-    if (taskSignal?.aborted) throw new Error('任务被中止');
+    const taskSignal = getTaskSignal();
+    throwIfAborted(taskSignal);
 
     const launchOptions = {
         headless: true,
@@ -102,7 +121,7 @@ const resolveMediaByBrowser = async (fullUrl, updateStatus) => {
     const browser = await chromium.launch(launchOptions);
     if (taskSignal?.aborted) {
         await browser.close().catch(() => {});
-        throw new Error('任务被中止');
+        throw createAbortError();
     }
     serverState.browser = browser;
 

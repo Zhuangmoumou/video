@@ -205,8 +205,18 @@ function extractM3U8Url(player, pageUrl) {
     throw new Error('player_aaaa 中未找到当前视频的 m3u8 链接');
 }
 
-async function fetchText(url, refererUrl, accept = '*/*') {
+function throwIfAborted(signal) {
+    if (signal?.aborted) {
+        const err = new Error('任务被中止');
+        err.name = 'AbortError';
+        throw err;
+    }
+}
+
+async function fetchText(url, refererUrl, accept = '*/*', signal) {
+    throwIfAborted(signal);
     const res = await http.get(url, {
+        signal,
         responseType: 'text',
         headers: {
             Accept: accept,
@@ -217,8 +227,10 @@ async function fetchText(url, refererUrl, accept = '*/*') {
     return typeof res.data === 'string' ? res.data : String(res.data);
 }
 
-async function fetchBuffer(url, refererUrl) {
+async function fetchBuffer(url, refererUrl, signal) {
+    throwIfAborted(signal);
     const res = await http.get(url, {
+        signal,
         responseType: 'arraybuffer',
         headers: {
             Accept: '*/*',
@@ -310,10 +322,11 @@ function parseM3u8Media(content, playlistUrl) {
 }
 
 /** 处理多码率 master playlist，跟随到实际媒体列表 */
-async function resolvePlaylist(url, refererUrl) {
+async function resolvePlaylist(url, refererUrl, signal) {
     let currentUrl = url;
     for (let depth = 0; depth < 3; depth++) {
-        const content = await fetchText(currentUrl, refererUrl, 'application/vnd.apple.mpegurl,*/*');
+        throwIfAborted(signal);
+        const content = await fetchText(currentUrl, refererUrl, 'application/vnd.apple.mpegurl,*/*', signal);
         const lines = content.split('\n');
         let subPath = null;
         for (let i = 0; i < lines.length; i++) {
@@ -396,17 +409,18 @@ function buildCandidateWindow(segments) {
 }
 
 /** 下载候选窗口内的 TS，记录 bytes 和可诊断的 realDuration。 */
-async function probeCandidateWindow(segments, refererUrl) {
+async function probeCandidateWindow(segments, refererUrl, signal) {
     const window = buildCandidateWindow(segments);
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'danzhu-ts-'));
 
     try {
         let measured = 0;
         for (let i = window.start; i <= window.end; i++) {
+            throwIfAborted(signal);
             const seg = segments[i];
             const filepath = path.join(tmpDir, `${i}_${seg.name || 'seg.ts'}`);
             try {
-                const data = await fetchBuffer(seg.url, refererUrl);
+                const data = await fetchBuffer(seg.url, refererUrl, signal);
                 seg.bytes = data.length;
                 fs.writeFileSync(filepath, data);
                 const dur = getRealDuration(filepath);
@@ -415,6 +429,9 @@ async function probeCandidateWindow(segments, refererUrl) {
                     measured += 1;
                 }
             } catch (e) {
+                if (e?.name === 'AbortError' || e?.name === 'CanceledError' || e?.code === 'ERR_CANCELED' || signal?.aborted) {
+                    throw e;
+                }
                 seg.probeError = e.message || String(e);
             }
         }
@@ -577,8 +594,8 @@ function absolutizeKeyLine(keyLine, baseUrl) {
  * 定位广告分片 → 写本地 m3u8。
  * 失败时回退：仍写一份「未裁切」的绝对路径 m3u8，保证主流程可下载。
  */
-async function buildAdFreeM3u8File(m3u8Url, refererUrl, episodeId) {
-    const { content, url: resolvedUrl } = await resolvePlaylist(m3u8Url, refererUrl);
+async function buildAdFreeM3u8File(m3u8Url, refererUrl, episodeId, signal) {
+    const { content, url: resolvedUrl } = await resolvePlaylist(m3u8Url, refererUrl, signal);
     const { headerLines, segments } = parseM3u8Media(content, resolvedUrl);
     if (!segments.length) {
         throw new Error('m3u8 未解析到任何 TS 分片');
@@ -590,7 +607,7 @@ async function buildAdFreeM3u8File(m3u8Url, refererUrl, episodeId) {
 
     try {
         // 1) EXTINF 粗略估计 06:03～06:04 附近，只下载小窗口内的 TS
-        const probe = await probeCandidateWindow(segments, refererUrl);
+        const probe = await probeCandidateWindow(segments, refererUrl, signal);
         // 2) 使用已验证的字节特征优先定位广告首片：1796904 bytes > 近似 > 大于 1MiB > EXTINF 兜底
         const choice = chooseFirstAdIndex(segments, probe);
         firstAdIdx = choice.index;
@@ -625,6 +642,9 @@ async function buildAdFreeM3u8File(m3u8Url, refererUrl, episodeId) {
             removedCount: removeSet.size,
         };
     } catch (e) {
+        if (e?.name === 'AbortError' || e?.name === 'CanceledError' || e?.code === 'ERR_CANCELED' || signal?.aborted) {
+            throw e;
+        }
         probeMeta = { reason: 'probe-failed', error: e.message || String(e) };
         removeSet = new Set();
         firstAdIdx = -1;
@@ -668,13 +688,15 @@ async function buildAdFreeM3u8File(m3u8Url, refererUrl, episodeId) {
 
 async function download(input, options = {}) {
     const { id, pageUrl } = normalizeInput(input);
+    const signal = options.signal;
+    throwIfAborted(signal);
 
-    const pageHtml = await fetchText(pageUrl, SITE + '/');
+    const pageHtml = await fetchText(pageUrl, SITE + '/', 'text/html,*/*', signal);
     const pageTitle = extractPageTitle(pageHtml);
     const player = parsePlayerAaaa(pageHtml);
     const m3u8Url = extractM3U8Url(player, pageUrl);
 
-    const adFree = await buildAdFreeM3u8File(m3u8Url, pageUrl, id);
+    const adFree = await buildAdFreeM3u8File(m3u8Url, pageUrl, id, signal);
 
     // 返回本地 m3u8 路径；主程序按 m3u8 下载分片（分片仍是远程绝对 URL）
     // 不再返回 cutRanges —— 广告已在 playlist 层剔除
@@ -682,7 +704,6 @@ async function download(input, options = {}) {
         url: adFree.localPath,
         pageUrl,
         pageTitle,
-        title: pageTitle,
         episodeId: id,
         originalM3u8: m3u8Url,
         adCut: {

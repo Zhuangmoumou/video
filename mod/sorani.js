@@ -39,8 +39,29 @@ const http = axios.create({
     validateStatus: (status) => status >= 200 && status < 500,
 });
 
-function sleep(ms) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
+function throwIfAborted(signal) {
+    if (signal?.aborted) {
+        const err = new Error('任务被中止');
+        err.name = 'AbortError';
+        throw err;
+    }
+}
+
+function sleep(ms, signal) {
+    throwIfAborted(signal);
+    return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+            if (signal) signal.removeEventListener('abort', onAbort);
+            resolve();
+        }, ms);
+        const onAbort = () => {
+            clearTimeout(timer);
+            const err = new Error('任务被中止');
+            err.name = 'AbortError';
+            reject(err);
+        };
+        if (signal) signal.addEventListener('abort', onAbort, { once: true });
+    });
 }
 
 function formatEpisodePath(order) {
@@ -225,13 +246,14 @@ function unwrapApi(payload, label) {
     return payload.data !== undefined ? payload.data : payload;
 }
 
-async function apiGet(pathname, { retries = 2 } = {}) {
+async function apiGet(pathname, { retries = 2, signal } = {}) {
     const url = `${API_BASE}${pathname.startsWith('/') ? pathname : `/${pathname}`}`;
     let lastError;
 
     for (let attempt = 0; attempt <= retries; attempt += 1) {
+        throwIfAborted(signal);
         try {
-            const res = await http.get(url);
+            const res = await http.get(url, { signal });
             if (res.status === 429 || res.status === 502 || res.status === 503 || res.status === 504) {
                 throw new Error(`HTTP ${res.status}`);
             }
@@ -240,9 +262,12 @@ async function apiGet(pathname, { retries = 2 } = {}) {
             }
             return unwrapApi(res.data, pathname);
         } catch (error) {
+            if (error?.name === 'AbortError' || error?.name === 'CanceledError' || error?.code === 'ERR_CANCELED' || signal?.aborted) {
+                throw error;
+            }
             lastError = error;
             if (attempt < retries) {
-                await sleep(400 * (attempt + 1));
+                await sleep(400 * (attempt + 1), signal);
                 continue;
             }
         }
@@ -318,18 +343,19 @@ function pickEpisodeOrder(requested, orders, detail) {
     return list[list.length - 1];
 }
 
-async function resolvePlayUrl(episodeId, lineCode) {
+async function resolvePlayUrl(episodeId, lineCode, signal) {
     const query = lineCode ? `?lineCode=${encodeURIComponent(lineCode)}` : '';
     const path = `/api/video/episode/${episodeId}/play${query}`;
 
     // 播放接口有频率限制，失败时退避重试
     let lastMessage = '';
     for (let attempt = 0; attempt < 4; attempt += 1) {
+        throwIfAborted(signal);
         if (attempt > 0) {
-            await sleep(800 * attempt);
+            await sleep(800 * attempt, signal);
         }
 
-        const data = await apiGet(path, { retries: 1 });
+        const data = await apiGet(path, { retries: 1, signal });
         const playUrl = String(data?.playUrl || '').trim();
         const canPlay = data?.canPlay;
         const message = data?.message || data?.msg || '';
@@ -368,15 +394,18 @@ function pickEpisodeTitle(episode, order) {
  * @param {string} input
  * @param {object} [options]
  * @param {boolean} [options.meta]
+ * @param {AbortSignal} [options.signal] 任务中止信号（主程序 stop 时传入）
  */
 async function download(input, options = {}) {
     const parsed = normalizeInput(input);
     const { videoId, pageUrl } = parsed;
+    const signal = options.signal;
+    throwIfAborted(signal);
 
-    const detail = await apiGet(`/api/video/${videoId}`);
+    const detail = await apiGet(`/api/video/${videoId}`, { signal });
     const title = String(detail?.title || '').trim() || null;
 
-    const lines = await apiGet(`/api/video/${videoId}/play-lines`);
+    const lines = await apiGet(`/api/video/${videoId}/play-lines`, { signal });
     const line = pickLine(lines, parsed);
     const lineCode = String(line?.code || '').trim();
     if (!lineCode) {
@@ -385,6 +414,7 @@ async function download(input, options = {}) {
 
     const orders = await apiGet(
         `/api/video/${videoId}/play-lines/${encodeURIComponent(lineCode)}/episode-orders`,
+        { signal },
     );
     const episodeOrder = pickEpisodeOrder(parsed.episodeOrder, orders, detail);
 
@@ -394,6 +424,7 @@ async function download(input, options = {}) {
         : String(episodeOrder);
     const episode = await apiGet(
         `/api/video/episode/video/${videoId}/episode/${encodeURIComponent(orderPath)}`,
+        { signal },
     );
     const episodeId = Number(episode?.episodeId ?? episode?.id);
     if (!Number.isFinite(episodeId) || episodeId <= 0) {
@@ -403,7 +434,7 @@ async function download(input, options = {}) {
     const episodeTitle = pickEpisodeTitle(episode, episodeOrder);
     const finalPageUrl = buildPageUrl(videoId, episodeOrder);
 
-    const play = await resolvePlayUrl(episodeId, lineCode);
+    const play = await resolvePlayUrl(episodeId, lineCode, signal);
     const mediaUrl = play.playUrl;
 
     if (!/^https?:\/\//i.test(mediaUrl)) {
@@ -417,7 +448,6 @@ async function download(input, options = {}) {
             url: mediaUrl,
             pageUrl: finalPageUrl,
             pageTitle,
-            title: pageTitle,
             videoId,
             episodeId,
             episodeOrder,
@@ -433,7 +463,6 @@ async function download(input, options = {}) {
         url: mediaUrl,
         pageUrl: finalPageUrl,
         pageTitle,
-        title: pageTitle,
     };
 }
 

@@ -30,7 +30,9 @@
 ```js
 /**
  * @param {string} input  任务请求里的 url 字段原样传入
- * @param {object} [options]  可选；当前主程序传入 `{ meta: true }`
+ * @param {object} [options]  主程序固定传入 `{ meta: true }`（详见下方 2.1.1）
+ *   - options.meta  (boolean)：true 时返回完整元数据对象，false/不传时返回字符串
+ *   - options.site  (string)：可选，覆盖站点根 URL（仅部分插件使用）
  * @returns {Promise<string|object>|string|object}
  */
 async function download(input, options = {}) {
@@ -52,13 +54,28 @@ module.exports = { download };
 
 插件应自行校验/规范化 `input`，格式不对时 **抛出 Error**。
 
+### 2.1.1 入参 `options`
+
+主程序调用插件时固定传入 `{ meta: true }`：
+
+| 字段 | 类型 | 主程序行为 | 含义 |
+|------|------|-----------|------|
+| `meta` | boolean | **始终传 `true`** | `true` 时要求返回完整元数据对象（下方 B 类）；`false` 时返回媒体 URL 字符串（下方 A 类）。建议同时支持两种模式，CLI 调试走 `meta: false`，主程序调用走 `meta: true` |
+| `signal` | `AbortSignal` | **停止任务时传入** | 用户点「停止」时主程序会 abort 该信号。插件应把它传给 axios/`fetch` 等请求，并在长循环间检查 `signal.aborted`，否则解析阶段无法被打断 |
+| `site` | string | 不传 | 仅 `mgnacg` 等特定插件使用，允许覆盖站点根 URL，默认取插件内置常量 |
+
+> 主程序在调用插件时还会用 `AbortSignal` 与插件 Promise 竞速：即便旧插件未处理 `signal`，停止也能立刻结束等待；但只有插件真正把 `signal` 传给网络请求，才能取消底层 HTTP。
+
 ### 2.2 返回值（二选一）
 
 主程序通过 `normalizeModResult` 统一处理，支持：
 
 #### A. 字符串（最简）
 
-直接返回媒体直链（必须是 `http://` 或 `https://`）：
+直接返回媒体直链，支持以下形式：
+
+- 远程 `http(s)` 链接：`https://cdn.example.com/a.mp4` 或 `https://cdn.example.com/index.m3u8`
+- 本地 m3u8 绝对路径：`/tmp/danzhu_xxx.m3u8`（用于播放后改写 playlist 再下载）：
 
 ```js
 return 'https://cdn.example.com/a.mp4';
@@ -72,6 +89,7 @@ return 'https://cdn.example.com/index.m3u8';
 return {
   url: 'https://cdn.example.com/a.mp4', // 必填（也可用 mediaUrl）
   pageUrl: 'https://site.example/play/1', // 可选，用作下载 Referer
+  pageTitle: '某番剧 第3话', // 可选，写入日志并回传给客户端
   cutRanges: [{ start: 364, end: 384 }], // 可选，压缩时删除的片段，单位秒
   // referer / refererUrl 同样可被识别为 Referer
 };
@@ -81,6 +99,7 @@ return {
 |------|------|------|
 | `url` 或 `mediaUrl` | 是 | 最终可下载的媒体地址（mp4 / m3u8 等）；内置插件也可返回绝对路径的本地 m3u8 |
 | `pageUrl` / `referer` / `refererUrl` | 否 | 下载时的 Referer/Origin 来源页 |
+| `pageTitle` / `title` / `vod_name` | 否 | 视频标题；打印到任务日志，并作为完成响应里的 `title` 字段回传。三个别名按此优先级取首个非空值，**只需返回其中一个** |
 | `cutRanges` | 否 | 压缩时删除的片段数组，如 `[{ "start": 364, "end": 384 }]`；也支持 `MM:SS` / `HH:MM:SS` 字符串 |
 
 其它字段可自行附加（便于调试），主程序会保留在内部 meta 中，但不保证对外暴露。
@@ -195,11 +214,12 @@ return {
 
 1. **纯 Node 解析优先**：HTTP + 解密/正则即可，避免依赖浏览器。
 2. **超时与错误信息**：axios 等请求加 timeout；`Error.message` 写清失败步骤，便于日志排查。
-3. **Referer 尽量返回**：若对象存储/CDN 校验来源，请在返回对象里带 `pageUrl`。
-4. **不要跟随到最终 302 文件流**：返回「播放器使用的媒体 URL」即可；MP4 的 302 中转由主程序处理。
-5. **副作用要小**：启动 `require` 时不要做网络请求；重逻辑放在 `download` 内。
-6. **依赖**：可使用项目已安装依赖（如 `axios`）；新增依赖需写进根目录 `package.json`。
-7. **安全**：`download` 的 `input` 来自外部请求，注意注入与路径穿越；不要 `eval` 不可信内容。
+3. **支持停止**：把 `options.signal` 传给所有 HTTP 请求；长循环/重试/sleep 中检查 `signal.aborted`，中止时抛 `AbortError`（或 `new Error('任务被中止')`）。
+4. **Referer 尽量返回**：若对象存储/CDN 校验来源，请在返回对象里带 `pageUrl`。
+5. **不要跟随到最终 302 文件流**：返回「播放器使用的媒体 URL」即可；MP4 的 302 中转由主程序处理。
+6. **副作用要小**：启动 `require` 时不要做网络请求；重逻辑放在 `download` 内。
+7. **依赖**：可使用项目已安装依赖（如 `axios`）；新增依赖需写进根目录 `package.json`。
+8. **安全**：`download` 的 `input` 来自外部请求，注意注入与路径穿越；不要 `eval` 不可信内容。
 
 ---
 
@@ -248,24 +268,6 @@ if (require.main === module) {
 ```bash
 # 单独跑插件（推荐每个插件像 mgnacg 一样支持 require.main）
 node mod/mgnacg.js 1619-3-2
-
-# 启动主服务后发任务
-curl -N -H 'Content-Type: application/json' \
-  -H 'Authorization: Bearer TOKEN' \
-  -d '{"url":"1619-3-2","code":1}' \
-  http://127.0.0.1:9898/
-
-# 指定插件
-curl -N -H 'Content-Type: application/json' \
-  -H 'Authorization: Bearer TOKEN' \
-  -d '{"url":"1619-3-2","code":1,"mod":"mgnacg"}' \
-  http://127.0.0.1:9898/
-
-# 指定 danzhu 插件，可传完整 URL 或编号
-curl -N -H 'Content-Type: application/json' \
-  -H 'Authorization: Bearer TOKEN' \
-  -d '{"url":"6477-1-1","code":1,"mod":"danzhu"}' \
-  http://127.0.0.1:9898/
 ```
 
 任务日志中与插件相关的标识：
