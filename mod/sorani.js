@@ -19,6 +19,7 @@
  */
 
 const axios = require('axios');
+const { getAxiosProxyConfig } = require('../src/download/mp4');
 
 const SITE = 'https://www.sorani.net';
 const API_BASE = 'https://api.sorani.cc/sorani-cms';
@@ -253,7 +254,7 @@ async function apiGet(pathname, { retries = 2, signal } = {}) {
     for (let attempt = 0; attempt <= retries; attempt += 1) {
         throwIfAborted(signal);
         try {
-            const res = await http.get(url, { signal });
+            const res = await http.get(url, { signal, proxy: getAxiosProxyConfig() });
             if (res.status === 429 || res.status === 502 || res.status === 503 || res.status === 504) {
                 throw new Error(`HTTP ${res.status}`);
             }
