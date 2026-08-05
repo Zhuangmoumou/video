@@ -4,7 +4,7 @@ const { pipeline } = require('stream/promises');
 const { ROOT_DIR, OUT_DIR, API_DEFAULT_RESOLUTION, FRONTEND_DEFAULT_RESOLUTION, RESOLUTION_PRESETS, getUiResolutionOptions } = require('./config');
 const { sanitizeModName, sanitizeTaskFileBase, resolveInsideDir, splitTaskFiles } = require('./utils/validation');
 const { createProgressLimiter, createSpeedAverager } = require('./utils/progress');
-const { isAbortError, sleep: abortableSleep, throwIfAborted } = require('./utils/abort');
+const { isAbortError, throwIfAborted } = require('./utils/abort');
 const { downloadM3U8 } = require('./download/m3u8');
 const { downloadMp4WithRedirects, getAxiosProxyConfig, formatSpeed } = require('./download/mp4');
 const { compressVideo, formatCutRange } = require('./videoProcessor');
@@ -269,11 +269,6 @@ const processTask = async (urlFragment, file = null, code, res, modName = null, 
         const isM3U8 = mediaUrl.toLowerCase().includes('.m3u8');
         state.currentTask = isM3U8 ? 'M3U8下载' : 'MP4下载';
         state.abortController ||= new AbortController();
-        throwIfAborted(state.abortController.signal);
-
-        // 下载前等待2秒（可被停止打断）
-        updateStatus(null, '⏳ 下载前等待 2 秒...');
-        await abortableSleep(2000, state.abortController.signal);
         throwIfAborted(state.abortController.signal);
 
         if (isM3U8) {
