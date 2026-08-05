@@ -72,6 +72,10 @@ function formatAxiosError(error, context = '') {
     add('timeout', error?.config?.timeout);
     add('status', error?.response?.status);
     add('statusText', error?.response?.statusText);
+    const body = error?.response?.data;
+    if (body != null && body !== '') {
+        add('body', (Buffer.isBuffer(body) ? body.toString('utf8') : typeof body === 'string' ? body : JSON.stringify(body)).slice(0, 200));
+    }
 
     const cause = error?.cause;
     if (cause) {
