@@ -327,6 +327,9 @@ async function downloadM3U8(m3u8Url, outputPath, onProgress, serverState, refere
 
         let downloadedCount = 0;
         let totalBytes = 0;
+        // 已向速度采样器报告过的最大字节数（并发分片乐观累计，保持单调不减，
+        // 避免并发下字节数回退触发采样器重置）
+        let sampledBytes = 0;
         const downloadSpeed = createSpeedAverager();
         downloadSpeed.sample(0);
         const shouldReportProgress = createProgressLimiter();
@@ -344,45 +347,64 @@ async function downloadM3U8(m3u8Url, outputPath, onProgress, serverState, refere
             onProgress(percent, `${currMB}MB`, segProgress, speed > 0 ? formatSpeed(speed) : '');
         };
 
-        for (let i = 0; i < segments.length; i += CONCURRENCY) {
-            if (serverState.abortController?.signal.aborted) throw new Error("任务被中止");
-            
-            const chunk = segments.slice(i, i + CONCURRENCY);
-            await Promise.all(chunk.map(async (segment, index) => {
-                const realIndex = i + index;
-                const tsFileName = `seg_${String(realIndex).padStart(5, '0')}.ts`;
-                const tsPath = path.join(tempDir, tsFileName);
-                const url = applyProxy(segment.url);
-                
-                let response;
-                try {
-                    response = await axios({
-                        url,
-                        responseType: 'arraybuffer',
-                        headers,
-                        timeout: 30000,
-                        signal: serverState.abortController?.signal,
-                        proxy: axiosProxy
-                    });
-                } catch (error) {
-                    console.error('[Axios Error] TS分片请求失败\n' + formatAxiosError(error, `segment=${realIndex + 1}/${totalSegments}`));
-                    throw error;
-                }
+        // 分片卡住（无下载进度）时也周期性上报，速度会随时间衰减到 0，而不是停在旧值
+        const speedTimer = setInterval(() => reportProgress(true), 1000);
 
-                let data = Buffer.from(response.data);
-                if (segment.key?.method === 'AES-128') {
-                    const key = await loadKey(segment.key.uri);
-                    data = decryptAes128(data, key, segment.key.iv);
-                }
+        try {
+            for (let i = 0; i < segments.length; i += CONCURRENCY) {
+                if (serverState.abortController?.signal.aborted) throw new Error("任务被中止");
 
-                await fs.writeFile(tsPath, data);
-                
-                totalBytes += data.length;
-                downloadSpeed.sample(totalBytes);
-                downloadedCount++;
-                ffmpegList[realIndex] = `file '${tsFileName}'`;
-                reportProgress(false);
-            }));
+                const chunk = segments.slice(i, i + CONCURRENCY);
+                await Promise.all(chunk.map(async (segment, index) => {
+                    const realIndex = i + index;
+                    const tsFileName = `seg_${String(realIndex).padStart(5, '0')}.ts`;
+                    const tsPath = path.join(tempDir, tsFileName);
+                    const url = applyProxy(segment.url);
+                    const baseBytes = totalBytes;
+
+                    let response;
+                    try {
+                        response = await axios({
+                            url,
+                            responseType: 'arraybuffer',
+                            headers,
+                            timeout: 30000,
+                            signal: serverState.abortController?.signal,
+                            proxy: axiosProxy,
+                            onDownloadProgress: (e) => {
+                                // 每片报告"本片起点 + 本片已下载"，取全局最大值保持单调
+                                const optimistic = Math.max(totalBytes, baseBytes + (e.loaded || 0));
+                                if (optimistic > sampledBytes) {
+                                    sampledBytes = optimistic;
+                                    downloadSpeed.sample(sampledBytes);
+                                }
+                            }
+                        });
+                    } catch (error) {
+                        console.error('[Axios Error] TS分片请求失败\n' + formatAxiosError(error, `segment=${realIndex + 1}/${totalSegments}`));
+                        throw error;
+                    }
+
+                    let data = Buffer.from(response.data);
+                    if (segment.key?.method === 'AES-128') {
+                        const key = await loadKey(segment.key.uri);
+                        data = decryptAes128(data, key, segment.key.iv);
+                    }
+
+                    await fs.writeFile(tsPath, data);
+
+                    totalBytes += data.length;
+                    if (totalBytes > sampledBytes) {
+                        sampledBytes = totalBytes;
+                        downloadSpeed.sample(totalBytes);
+                    }
+                    downloadedCount++;
+                    ffmpegList[realIndex] = `file '${tsFileName}'`;
+                    reportProgress(false);
+                }));
+            }
+        } finally {
+            clearInterval(speedTimer);
         }
         reportProgress(true);
 

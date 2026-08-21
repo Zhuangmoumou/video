@@ -302,20 +302,30 @@ const processTask = async (urlFragment, file = null, code, res, modName = null, 
             const downloadSpeed = createSpeedAverager();
             downloadSpeed.sample(0);
             const shouldReportDownloadProgress = createProgressLimiter();
-            response.data.on('data', (c) => {
-                curr += c.length;
-                const now = Date.now();
-                downloadSpeed.sample(curr, now);
-                const p = total ? Math.floor((curr / total) * 100) : 0;
-                if (!shouldReportDownloadProgress({ percent: p })) return;
 
-                const speed = downloadSpeed.getSpeed();
+            const renderDownloadStatus = (now = Date.now()) => {
+                const p = total ? Math.floor((curr / total) * 100) : 0;
+                const speed = downloadSpeed.getSpeed(now);
                 const speedText = speed > 0 ? ` ${formatSpeed(speed)}` : '';
                 const currMB = (curr / 1024 / 1024).toFixed(2);
                 updateStatus(null, `📥 下载: ${p}% (${currMB}/${totalMB}MB)${speedText}`);
+            };
+
+            response.data.on('data', (c) => {
+                curr += c.length;
+                downloadSpeed.sample(curr, Date.now());
+                const p = total ? Math.floor((curr / total) * 100) : 0;
+                if (!shouldReportDownloadProgress({ percent: p })) return;
+                renderDownloadStatus();
             });
 
-            await pipeline(response.data, fs.createWriteStream(downloadPath));
+            // 下载卡住（无 data 事件）时也周期性刷新，速度会随时间衰减到 0，而不是停在旧值
+            const speedTimer = setInterval(() => renderDownloadStatus(), 1000);
+            try {
+                await pipeline(response.data, fs.createWriteStream(downloadPath));
+            } finally {
+                clearInterval(speedTimer);
+            }
         }
 
         state.currentTask = 'FFmpeg压缩';
