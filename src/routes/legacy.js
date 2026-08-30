@@ -3,8 +3,8 @@ const express = require('express');
 module.exports = function createLegacyRouter(deps) {
     const {
         requireBearerAuth, taskManager, taskService, modLoader, logStore,
-        splitTaskUrls, splitTaskFiles, sanitizeModName, getCompressionProfile,
-        RESOLUTION_PRESETS, API_DEFAULT_RESOLUTION, OUT_DIR, fs, path
+        splitTaskUrls, splitTaskFiles, sanitizeModName, getOriginConfig,
+        getCompressionProfile, RESOLUTION_PRESETS, API_DEFAULT_RESOLUTION, OUT_DIR, fs, path
     } = deps;
     const router = express.Router();
     const state = taskManager.state;
@@ -51,6 +51,17 @@ router.post('/', requireBearerAuth, async (req, res) => {
     if (body === 'ls' || body.ls) {
         const files = await fs.readdir(OUT_DIR);
         res.write(JSON.stringify({ "type": "ls", "ls": files }) + '\n');
+        res.end(); return;
+    }
+
+    // 元数据：插件列表 + 来源模板
+    if (body === 'meta' || body.meta) {
+        const origins = await getOriginConfig();
+        res.write(JSON.stringify({
+            "type": "meta",
+            "mods": ['none', ...mods.keys()],
+            "origins": origins
+        }) + '\n');
         res.end(); return;
     }
 

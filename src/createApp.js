@@ -1,7 +1,7 @@
 const express = require('express');
 const fs = require('fs-extra');
 const path = require('path');
-const { PUBLIC_DIR, OUT_DIR, API_DEFAULT_RESOLUTION, RESOLUTION_PRESETS, getCompressionProfile } = require('./config');
+const { PUBLIC_DIR, OUT_DIR, API_DEFAULT_RESOLUTION, RESOLUTION_PRESETS, getCompressionProfile, getOriginConfig } = require('./config');
 const { createLogStore, installConsoleCapture } = require('./logStore');
 const { createModLoader } = require('./modLoader');
 const { createAuthService } = require('./auth');
@@ -92,6 +92,7 @@ function createApp() {
         splitTaskUrls,
         splitTaskFiles,
         sanitizeModName,
+        getOriginConfig,
         getCompressionProfile,
         RESOLUTION_PRESETS,
         API_DEFAULT_RESOLUTION,
