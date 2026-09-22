@@ -160,8 +160,8 @@ function extractMetaKeyParts(html) {
 function extractConfigCipher(html) {
     // var config = { "url": "...", ... }
     const m =
-        html.match(/"url"\s*:\s*"([A-Za-z0-9+/=]{32,})"/) ||
-        html.match(/url\s*:\s*["']([A-Za-z0-9+/=]{32,})["']/);
+        html.match(/"url"\s*:\s*"([A-Za-z0-9+/=]{16,})"/) ||
+        html.match(/url\s*:\s*["']([A-Za-z0-9+/=]{16,})["']/);
     if (!m) throw new Error('解析页未找到 AES 密文 url 字段');
     return m[1];
 }
@@ -178,15 +178,17 @@ function aesDecryptPlayUrl(cipherB64, keyMaterial) {
     return plain.trim();
 }
 
-function pickParseBase(player) {
+function pickParseBase(player, sid) {
     const from = player.from || '';
-    if (FROM_PARSE[from] !== undefined) {
-        if (!FROM_PARSE[from]) {
-            throw new Error(`线路 ${from} 已下线或不可用`);
-        }
-        return FROM_PARSE[from];
+    const mappedFrom = FROM_PARSE[from] !== undefined ? from : SID_LINE[sid]?.from;
+
+    if (mappedFrom && FROM_PARSE[mappedFrom]) {
+        return FROM_PARSE[mappedFrom];
     }
-    throw new Error(`未知线路 from=${from}，请更新 FROM_PARSE 映射`);
+    if (FROM_PARSE[from] === null) {
+        throw new Error(`线路 ${from} 已下线或不可用`);
+    }
+    throw new Error(`未知线路 sid=${sid} from=${from}，请更新线路映射`);
 }
 
 /**
@@ -221,7 +223,7 @@ async function download(episodeId, options = {}) {
     const playUrl = resolvePlayUrl(player);
     if (!playUrl) throw new Error('player_aaaa.url 为空');
 
-    const parseBase = pickParseBase(player);
+    const parseBase = pickParseBase(player, info.sid);
     const parseUrl = parseBase + playUrl;
 
     // 2) 拉线路解析页
