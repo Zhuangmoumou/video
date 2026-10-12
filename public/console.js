@@ -12,7 +12,7 @@ const state = {
     mods: ['none'],
     resolutions: [],
     selectedOrigin: '',
-    selectedResolution: 'api-default',
+    selectedResolution: 'source',
     files: [],
     busy: false,
     streamText: '正在初始化...',
@@ -191,7 +191,7 @@ function renderResolutions(resolutions = []) {
         : (resolutions[0]?.id || 'api-default');
     state.selectedResolution = selected;
     els.resolutionSelect.value = selected;
-    els.apiStatus.textContent = selected === 'api-default' ? 'API 默认 320x170' : `分辨率 ${selected}`;
+    els.apiStatus.textContent = selected === 'api-default' ? '分辨率 320x170' : `分辨率 ${selected}`;
 }
 
 function renderFiles(files = []) {
@@ -504,7 +504,7 @@ function bindEvents() {
     els.resolutionSelect.addEventListener('change', () => {
         state.selectedResolution = els.resolutionSelect.value;
         els.apiStatus.textContent = state.selectedResolution === 'api-default'
-            ? 'API 默认 320x170'
+            ? '分辨率 320x170'
             : `分辨率 ${state.selectedResolution}`;
     });
     els.regenCode.addEventListener('click', () => {

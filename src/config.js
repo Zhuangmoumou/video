@@ -27,7 +27,7 @@ const RESOLUTION_PRESETS = Object.freeze({
         description: '兼容现有 API 的默认压缩分辨率',
         scaleFilter: SCALE_FILTER,
         passthrough: false,
-        ui: false
+        ui: true
     },
     source: {
         id: 'source', label: '原画质', description: '保留原始分辨率；无裁剪时直接输出',
@@ -51,7 +51,7 @@ const RESOLUTION_PRESETS = Object.freeze({
     }
 });
 
-const FRONTEND_RESOLUTION_ORDER = ['source', '1080p', '720p', '480p', '360p'];
+const FRONTEND_RESOLUTION_ORDER = ['source', '1080p', '720p', '480p', '360p', API_DEFAULT_RESOLUTION];
 const RESOLUTION_ALIASES = Object.freeze({
     default: API_DEFAULT_RESOLUTION, legacy: API_DEFAULT_RESOLUTION, '320x170': API_DEFAULT_RESOLUTION,
     source: 'source', original: 'source', raw: 'source', passthrough: 'source', '原画质': 'source',
