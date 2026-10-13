@@ -1,6 +1,6 @@
 # 插件编写规范（mod）
 
-本服务支持通过 `mod/` 目录下的脚本扩展「解析视频下载地址」能力。  
+本服务支持通过 `mod/` 目录下的脚本扩展下载地址解析、作品搜索和分集编号解析能力。
 启动时会自动扫描并加载所有符合规范的插件。
 
 ---
@@ -23,27 +23,21 @@
 
 ---
 
-## 2. 必须导出的接口
+## 2. 插件接口
 
-插件必须是 **CommonJS 模块**，并导出异步（或同步）函数 **`download`**：
+插件必须是 **CommonJS 模块**，至少导出 `download` 或 `search` 中的一种能力。同一站点的能力放在同一个文件中，例如 `mgnacg.js` 同时提供下载、搜索和分集解析：
 
 ```js
-/**
- * @param {string} input  任务请求里的 url 字段原样传入
- * @param {object} [options]  主程序固定传入 `{ meta: true }`（详见下方 2.1.1）
- *   - options.meta  (boolean)：true 时返回完整元数据对象，false/不传时返回字符串
- *   - options.site  (string)：可选，覆盖站点根 URL（仅部分插件使用）
- * @returns {Promise<string|object>|string|object}
- */
-async function download(input, options = {}) {
-  // ...
-  return 'https://example.com/video.mp4';
-}
-
-module.exports = { download };
+module.exports = { download, search, episodes };
 ```
 
-### 2.1 入参 `input`
+`search(keyword, options)` 返回包含兼容字段 `id`、`title`、`url` 的作品数组，可附加 `status` 和 `episodeCount`。`episodes(series, options)` 返回作品信息及 `episodes` 数组；每集的 `id` / `input` 是可以直接填入现有下载任务 `url` 字段的编号。
+
+- `search` 的 `options.limit` 为结果上限，`options.signal` 用于中止请求。
+- `episodes` 的 `series` 可为搜索结果对象、作品编号或作品 URL；`options.maxEpisodes` 限制返回的分集数，`options.signal` 用于中止解析。
+- 插件可以按需要导出 `download`、`search`、`episodes`。下载参数和返回值如下。
+
+### 2.1 下载入参 `input`
 
 - 来自请求 JSON 的 **`url` 字段原样传入**，不做协议校验。
 - 可能是：
@@ -54,7 +48,7 @@ module.exports = { download };
 
 插件应自行校验/规范化 `input`，格式不对时 **抛出 Error**。
 
-### 2.1.1 入参 `options`
+### 2.1.1 下载入参 `options`
 
 主程序调用插件时固定传入 `{ meta: true }`：
 
@@ -66,7 +60,7 @@ module.exports = { download };
 
 > 主程序在调用插件时还会用 `AbortSignal` 与插件 Promise 竞速：即便旧插件未处理 `signal`，停止也能立刻结束等待；但只有插件真正把 `signal` 传给网络请求，才能取消底层 HTTP。
 
-### 2.2 返回值（二选一）
+### 2.2 下载返回值（二选一）
 
 主程序通过 `normalizeModResult` 统一处理，支持：
 
@@ -104,7 +98,7 @@ return {
 
 其它字段可自行附加（便于调试），主程序会保留在内部 meta 中，但不保证对外暴露。
 
-### 2.3 失败时
+### 2.3 下载失败时
 
 - 请 **`throw new Error('可读原因')`**
 - 不要返回 `null` / `undefined` / 空字符串
@@ -120,21 +114,73 @@ return {
 
 1. 读取 `mod/*.js`
 2. `require` 模块
-3. 检查 `typeof mod.download === 'function'`
-4. 以「文件名去后缀」为 key 注册
+3. 检查模块是否导出 `download` 或 `search`
+4. 按能力分别注册，并以「文件名去后缀」为 key
 
 日志示例：
 
 ```text
-[Mod] 已加载插件: mgnacg (mgnacg.js)
-[Mod] 共加载 1 个插件: mgnacg
+[Mod] 已加载插件: mgnacg (mgnacg.js; download, search, episodes)
+[Mod] 共加载 4 个插件: mgnacg, danzhu, xifan, sorani
+[Mod] 搜索能力 2 个: mgnacg, sorani
 ```
 
-加载失败或未导出 `download` 的文件会被跳过，并打印错误日志。
+加载失败或未导出受支持能力的文件会被跳过，并打印错误日志。`GET /mod` 仍只返回可下载插件名，保持旧客户端响应格式。
 
 > 修改插件后需 **重启服务** 才会重新加载（启动时会清理 `require` 缓存）。
 
-### 3.2 任务解析策略
+### 3.2 搜索与分集 API（POST /mod）
+
+未指定 `mod` 时，主程序会搜索所有提供 `search` 的插件；指定 `mod` 时只搜索该站点。关键词字段兼容 `keyword`、`query`、`q`、`wd`、`search` 和 `url`。默认结果上限为 20，最多 50。
+
+```json
+{ "action": "search", "keyword": "柯南", "limit": 10 }
+```
+
+响应为数组，保留 `id`、`title`、`url`，并提供 `status`、`episodeCount` 和展开分集时使用的 `mod`：
+
+```json
+[
+  {
+    "id": "4634",
+    "title": "作品名",
+    "url": "https://www.sorani.net/anime/mal/4634",
+    "status": "连载中 第12集",
+    "episodeCount": 12,
+    "mod": "sorani"
+  }
+]
+```
+
+按作品获取每集编号：
+
+```json
+{ "action": "episodes", "mod": "sorani", "id": "4634" }
+```
+
+响应包含作品字段和 `episodes` 数组。每集的 `id` / `input` 可以直接作为下载请求的 `url`，然后继续用 `mod` 指定对应站点插件。sorani 的 `episodeId` 是站点内部集数编号，`id` 则是兼容现有下载接口的输入编号。
+
+```json
+{
+  "id": "4634",
+  "title": "作品名",
+  "status": "连载中",
+  "episodeCount": 12,
+  "episodes": [
+    { "id": "4634-1-1", "input": "4634-1-1", "episodeId": 10001, "title": "第1集", "url": "https://www.sorani.net/anime/mal/4634/episode/01" }
+  ]
+}
+```
+
+单站搜索示例：
+
+```json
+{ "action": "search", "mod": "mgnacg", "q": "柯南", "limit": 10 }
+```
+
+`maxEpisodes` 可限制分集响应数量，默认 300、最大 500；关键词最多 100 个字符。
+
+### 3.3 任务解析策略
 
 | 请求形态 | 使用插件 | 失败是否回退浏览器 |
 |----------|----------|--------------------|
@@ -152,7 +198,7 @@ return {
 - 无 `mod` 时，域名匹配 `mgnacg.com` 的完整 URL 也会先走 `mgnacg` 插件，失败后回退浏览器。
 - 用户指定 `mod` 时，`url` 可能不是网页链接，因此 **禁止** 再回退浏览器。
 
-### 3.3 请求 JSON 字段
+### 3.4 下载请求 JSON 字段
 
 ```json
 {
@@ -197,7 +243,7 @@ return {
 
 ---
 
-## 4. 插件解析成功后主程序做什么
+## 4. 下载插件解析成功后主程序做什么
 
 1. 取到 `mediaUrl`（及可选 Referer）
 2. 组装下载请求头（UA、Accept；若有 Referer 则带 Referer/Origin）
@@ -283,8 +329,8 @@ node mod/mgnacg.js 1619-3-2
 
 | 插件 | 文件 | 说明 |
 |------|------|------|
-| `mgnacg` | `mod/mgnacg.js` | 解析 mgnacg 选集编号为媒体直链；默认编号任务会优先调用 |
+| `mgnacg` | `mod/mgnacg.js` | 默认编号下载解析，并提供 mgnacg 作品搜索、状态、集数和分集编号 |
 | `danzhu` | `mod/danzhu.js` | 解析 dm.danzhuacg.com 播放页/编号为 m3u8，并在 playlist 层剔除广告分片 |
-| `sorani` | `mod/sorani.js` | 解析 www.sorani.net 番剧编号/URL 为 AES-128 m3u8 直链（需带站点 Referer） |
+| `sorani` | `mod/sorani.js` | 提供 www.sorani.net 搜索和分集编号，并将番剧编号/URL 解析为 AES-128 m3u8 直链（需带站点 Referer） |
 
 参考实现与线路说明见 `mgnacg.js` 文件头注释。

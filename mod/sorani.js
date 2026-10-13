@@ -23,6 +23,7 @@ const { getAxiosProxyConfig } = require('../src/download/mp4');
 
 const SITE = 'https://www.sorani.net';
 const API_BASE = 'https://api.sorani.cc/sorani-cms';
+const SEARCH_API_PATH = '/api/video';
 const HOSTS = new Set(['www.sorani.net', 'sorani.net']);
 const DEFAULT_UA =
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
@@ -391,6 +392,363 @@ function pickEpisodeTitle(episode, order) {
     return unique[0] || `第${order}集`;
 }
 
+async function listEpisodes(input, options = {}) {
+    const parsed = normalizeInput(input);
+    const { videoId } = parsed;
+    const signal = options.signal;
+    const maxEpisodes = Number(options.maxEpisodes ?? 300);
+    if (!Number.isInteger(maxEpisodes) || maxEpisodes < 1 || maxEpisodes > 500) {
+        throw new Error('maxEpisodes 必须是 1 到 500 之间的整数');
+    }
+    throwIfAborted(signal);
+
+    const detail = await apiGet(`/api/video/${videoId}`, { signal });
+    const lines = await apiGet(`/api/video/${videoId}/play-lines`, { signal });
+    const line = pickLine(lines, parsed);
+    const lineCode = String(line?.code || '').trim();
+    if (!lineCode) throw new Error('播放线路缺少 code');
+
+    const enabledLines = Array.isArray(lines)
+        ? lines.filter((item) => item && item.enable !== false && item.enabled !== false)
+        : [];
+    const availableLines = enabledLines.length > 0 ? enabledLines : (Array.isArray(lines) ? lines.filter(Boolean) : []);
+    const lineIndex = Math.max(0, availableLines.indexOf(line)) + 1;
+    const rawOrders = await apiGet(
+        `/api/video/${videoId}/play-lines/${encodeURIComponent(lineCode)}/episode-orders`,
+        { signal },
+    );
+    const orders = [...new Set(normalizeOrders(rawOrders))];
+    const episodes = await mapWithConcurrency(orders.slice(0, maxEpisodes), 4, async (order) => {
+        throwIfAborted(signal);
+        const episode = await apiGet(
+            `/api/video/episode/video/${videoId}/episode/${encodeURIComponent(String(order))}`,
+            { signal },
+        );
+        const episodeId = Number(episode?.episodeId ?? episode?.id);
+        if (!Number.isFinite(episodeId) || episodeId <= 0) {
+            throw new Error(`无法解析 episodeId: ${JSON.stringify(episode)?.slice(0, 120)}`);
+        }
+        const title = pickEpisodeTitle(episode, order);
+        const downloadId = `${videoId}-${lineIndex}-${order}`;
+        return {
+            id: downloadId,
+            input: downloadId,
+            episodeId,
+            order,
+            title,
+            url: buildPageUrl(videoId, order),
+        };
+    }, signal);
+
+    const status = [detail?.statusText, detail?.updateStatus, detail?.stateText, detail?.status]
+        .map((value) => String(value || '').trim())
+        .find(Boolean) || (detail?.isFinished === true ? '已完结' : '未知');
+
+    return {
+        id: String(videoId),
+        title: String(detail?.title || '').trim() || String(videoId),
+        url: buildPageUrl(videoId),
+        status,
+        episodeCount: orders.length,
+        episodes,
+        truncated: episodes.length < orders.length,
+        lineCode,
+    };
+}
+
+async function search(keyword, options = {}) {
+    const query = String(keyword || '').trim();
+    if (!query) throw new Error('搜索关键词不能为空');
+    const limit = normalizeSearchLimit(options.limit, 20, 50);
+    const sources = buildSearchSources(query, limit);
+    const errors = [];
+    let completed = 0;
+
+    for (const source of sources) {
+        throwIfAborted(options.signal);
+        try {
+            const results = await fetchSearchSource(source, query, options.signal);
+            completed += 1;
+            if (results.length) return results.slice(0, limit);
+        } catch (error) {
+            if (options.signal?.aborted) throw error;
+            errors.push(`${source.url}: ${error.message}`);
+        }
+    }
+
+    if (completed === 0 && errors.length) throw new Error(errors[0]);
+    return [];
+}
+
+async function episodes(input, options = {}) {
+    const series = input && typeof input === 'object' ? input : { id: input };
+    const rawId = series.id ?? series.videoId ?? series.seriesId ?? series.url;
+    const idText = String(rawId ?? '').trim();
+    const urlMatch = idText.match(/\/anime\/mal\/(\d+)/i);
+    const videoId = urlMatch ? urlMatch[1] : idText;
+    if (!/^\d+$/.test(videoId)) throw new Error(`非法 sorani 作品编号: ${rawId}`);
+
+    const result = await listEpisodes(videoId, { ...options, maxEpisodes: options.maxEpisodes ?? 300 });
+    return {
+        ...result,
+        title: String(series.title || result.title || videoId).trim(),
+        status: series.status && series.status !== '未知' ? series.status : result.status,
+        url: normalizeSoraniResultUrl(series.url, videoId),
+    };
+}
+
+function buildSearchSources(keyword, limit) {
+    const apiUrl = new URL(SEARCH_API_PATH.replace(/^\/+/, ''), `${API_BASE.replace(/\/+$/, '')}/`);
+    apiUrl.searchParams.set('page', '1');
+    apiUrl.searchParams.set('size', String(Math.min(limit, 100)));
+    apiUrl.searchParams.set('keyword', keyword);
+    const exploreUrl = new URL('anime/explore', `${SITE}/`);
+    exploreUrl.searchParams.set('keyword', keyword);
+    return [
+        { type: 'json', trusted: true, url: apiUrl.toString() },
+        { type: 'html', trusted: false, url: exploreUrl.toString() },
+        { type: 'html', trusted: false, url: `${SITE}/` },
+    ];
+}
+
+async function fetchSearchSource(source, keyword, parentSignal) {
+    const { response, body } = await fetchTextWithTimeout(source.url, {
+        signal: parentSignal,
+        headers: {
+            'User-Agent': DEFAULT_UA,
+            Accept: source.type === 'json'
+                ? 'application/json,text/plain,*/*'
+                : 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'zh-CN,zh;q=0.9',
+            Referer: `${SITE}/`,
+        },
+    });
+    if (!response.ok) {
+        if ([400, 404, 405].includes(response.status)) return [];
+        throw new Error(`HTTP ${response.status} ${response.statusText}`);
+    }
+    const contentType = response.headers.get('content-type') || '';
+    const parsed = source.type === 'json' || contentType.includes('application/json')
+        ? parseSearchJson(body)
+        : parseSearchHtml(body);
+    return selectSearchResults(parsed, keyword, source.trusted);
+}
+
+function parseSearchJson(body) {
+    let payload;
+    try {
+        payload = JSON.parse(body);
+    } catch (_) {
+        return [];
+    }
+    const results = [];
+    const seen = new Set();
+    collectSearchObjects(payload, results, seen);
+    return results;
+}
+
+function collectSearchObjects(value, results, seen) {
+    if (!value || typeof value !== 'object') return;
+    if (Array.isArray(value)) {
+        for (const item of value) collectSearchObjects(item, results, seen);
+        return;
+    }
+
+    const id = value.id ?? value.videoId ?? value.animeId ?? value.bangumiVideoId;
+    const title = value.title ?? value.name ?? value.videoTitle ?? value.animeTitle;
+    if (id != null && title) {
+        const episodeCountValue = value.episodeCount ?? value.totalEpisodes ?? value.episodesCount ?? value.latestEpisodeOrder;
+        const episodeCount = episodeCountValue == null || episodeCountValue === '' ? NaN : Number(episodeCountValue);
+        addSearchResult(results, seen, {
+            id: String(id),
+            title: cleanSearchText(String(title)),
+            alias: cleanSearchText(String(value.alias || '')),
+            pinyin: cleanSearchText(String(value.pinyin || '')),
+            initial: cleanSearchText(String(value.initial || '')),
+            categoryName: cleanSearchText(String(value.categoryName || '')),
+            status: pickSearchStatus(value),
+            episodeCount: Number.isFinite(episodeCount) && episodeCount >= 0
+                ? episodeCount
+                : countEpisodesInText(pickSearchStatus(value)),
+            url: normalizeSoraniResultUrl(value.url || value.path || value.href, id),
+        });
+    }
+    for (const item of Object.values(value)) collectSearchObjects(item, results, seen);
+}
+
+function parseSearchHtml(html) {
+    const results = [];
+    const seen = new Set();
+    const linkPattern = /<a\b[^>]*href=(["'])(?:https?:\/\/www\.sorani\.net)?\/anime\/mal\/(\d+)(?:[/?#][^"']*)?\1[^>]*>[\s\S]*?<\/a>/gi;
+    let match;
+    while ((match = linkPattern.exec(html))) {
+        const block = match[0];
+        const title = searchAttrValue(block, 'title') || searchAttrValue(block, 'alt') || cleanSearchText(block.replace(/<[^>]*>/g, ''));
+        addSearchResult(results, seen, {
+            id: match[2], title, status: '未知', episodeCount: null,
+            url: `${SITE}/anime/mal/${match[2]}`,
+        });
+    }
+
+    const itemPattern = /\bid:(\d+),title:("(?:\\.|[^"\\])*"|null)/g;
+    while ((match = itemPattern.exec(html))) {
+        const title = parseSearchJsString(match[2]);
+        if (!title) continue;
+        const blockEnd = html.indexOf('{id:', match.index + 4);
+        const block = html.slice(match.index, blockEnd < 0 ? Math.min(html.length, match.index + 8000) : blockEnd);
+        if (!/\b(?:bangumiId|categoryName|cover(?:Small|Thumb|Large)?|episodeCount|latestEpisode|statusText)\b/.test(block)) continue;
+        const status = pickSvelteSearchStatus(block);
+        addSearchResult(results, seen, {
+            id: match[1],
+            title: cleanSearchText(title),
+            status,
+            episodeCount: numberSearchField(block, 'episodeCount') || countEpisodesInText(status),
+            url: `${SITE}/anime/mal/${match[1]}`,
+        });
+    }
+    return results;
+}
+
+function addSearchResult(results, seen, result) {
+    const id = String(result.id || '').trim();
+    const title = cleanSearchText(result.title);
+    if (!/^\d+$/.test(id) || !title || seen.has(id)) return;
+    seen.add(id);
+    results.push({
+        id,
+        title,
+        status: result.status || '未知',
+        episodeCount: result.episodeCount ?? null,
+        url: result.url || `${SITE}/anime/mal/${id}`,
+        alias: result.alias || '',
+        pinyin: result.pinyin || '',
+        initial: result.initial || '',
+        categoryName: result.categoryName || '',
+    });
+}
+
+function selectSearchResults(results, keyword, trusted) {
+    const needle = normalizeSearchText(keyword);
+    const matched = results.filter((result) => normalizeSearchText(
+        [result.title, result.alias, result.pinyin, result.initial, result.categoryName].join(' '),
+    ).includes(needle));
+    const selected = matched.length || !trusted ? matched : results;
+    return selected.map(({ alias, pinyin, initial, categoryName, ...result }) => result);
+}
+
+function pickSearchStatus(value) {
+    const status = value.statusText || value.updateStatus || value.stateText;
+    const latestValue = value.latestEpisodeLabel || value.latestEpisode || value.latestEpisodeOrder || value.episodeLabel;
+    const latest = typeof latestValue === 'number' ? `第${latestValue}集` : latestValue;
+    if (status && latest) return `${cleanSearchText(String(status))} ${cleanSearchText(String(latest))}`;
+    if (latest) return cleanSearchText(String(latest));
+    if (status) return cleanSearchText(String(status));
+    const count = Number(value.episodeCount);
+    return Number.isFinite(count) && count > 0 ? `${count}集` : '未知';
+}
+
+function pickSvelteSearchStatus(block) {
+    const status = searchJsField(block, 'statusText');
+    const latest = searchJsField(block, 'latestEpisodeLabel');
+    if (status && latest) return `${status} ${latest}`;
+    if (status || latest) return status || latest;
+    const count = numberSearchField(block, 'episodeCount');
+    return count ? `${count}集` : '未知';
+}
+
+function searchJsField(block, name) {
+    const match = block.match(new RegExp(`\\b${name}:("(?:\\\\.|[^"\\\\])*"|null)`));
+    return match ? cleanSearchText(parseSearchJsString(match[1]) || '') : '';
+}
+
+function numberSearchField(block, name) {
+    const match = block.match(new RegExp(`\\b${name}:(\\d+)`));
+    return match ? Number.parseInt(match[1], 10) : 0;
+}
+
+function parseSearchJsString(value) {
+    if (!value || value === 'null') return '';
+    try { return JSON.parse(value); } catch (_) { return ''; }
+}
+
+function searchAttrValue(block, name) {
+    const match = block.match(new RegExp(`\\b${name}=(["'])([\\s\\S]*?)\\1`, 'i'));
+    return match ? cleanSearchText(decodeSearchEntities(match[2])) : '';
+}
+
+function cleanSearchText(value) {
+    return decodeSearchEntities(String(value || '').replace(/<[^>]*>/g, '')).replace(/\s+/g, ' ').trim();
+}
+
+function decodeSearchEntities(value) {
+    const entities = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ' };
+    return String(value || '').replace(/&(#x?[0-9a-f]+|[a-z]+);/gi, (match, entity) => {
+        const key = entity.toLowerCase();
+        if (key.startsWith('#x')) return String.fromCodePoint(Number.parseInt(key.slice(2), 16));
+        if (key.startsWith('#')) return String.fromCodePoint(Number.parseInt(key.slice(1), 10));
+        return entities[key] || match;
+    });
+}
+
+function countEpisodesInText(value) {
+    const match = String(value || '').match(/(?:第\s*)?(\d+(?:\.\d+)?)\s*集/);
+    return match ? Number(match[1]) : null;
+}
+
+function normalizeSearchText(value) {
+    return String(value || '').trim().toLocaleLowerCase('zh-CN');
+}
+
+function normalizeSoraniResultUrl(value, id) {
+    const fallback = `${SITE}/anime/mal/${id}`;
+    if (!value) return fallback;
+    try {
+        const url = new URL(String(value), SITE);
+        if (!HOSTS.has(url.hostname.toLowerCase())) return fallback;
+        return url.toString();
+    } catch (_) {
+        return fallback;
+    }
+}
+
+function normalizeSearchLimit(value, fallback, max) {
+    if (value == null) return fallback;
+    const limit = Number(value);
+    if (!Number.isInteger(limit) || limit < 1) throw new Error('limit 必须是正整数');
+    return Math.min(limit, max);
+}
+
+async function mapWithConcurrency(items, concurrency, worker, signal) {
+    const output = new Array(items.length);
+    let next = 0;
+    const workers = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+        while (true) {
+            throwIfAborted(signal);
+            const index = next++;
+            if (index >= items.length) return;
+            output[index] = await worker(items[index]);
+        }
+    });
+    await Promise.all(workers);
+    return output;
+}
+
+async function fetchTextWithTimeout(url, options = {}, timeoutMs = 15000) {
+    const controller = new AbortController();
+    const parentSignal = options.signal;
+    const abort = () => controller.abort(parentSignal.reason);
+    if (parentSignal?.aborted) abort();
+    else parentSignal?.addEventListener('abort', abort, { once: true });
+    const timer = setTimeout(() => controller.abort(new Error('请求超时')), timeoutMs);
+    try {
+        const response = await fetch(url, { ...options, signal: controller.signal });
+        return { response, body: await response.text() };
+    } finally {
+        clearTimeout(timer);
+        parentSignal?.removeEventListener('abort', abort);
+    }
+}
+
 /**
  * @param {string} input
  * @param {object} [options]
@@ -469,6 +827,9 @@ async function download(input, options = {}) {
 
 module.exports = {
     download,
+    search,
+    episodes,
+    listEpisodes,
     normalizeInput,
     buildPageUrl,
     formatEpisodePath,

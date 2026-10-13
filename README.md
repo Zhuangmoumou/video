@@ -342,6 +342,34 @@ mp4/                     下载/输出目录
 
 停止当前任务并清理 `mp4/` 及 `mp4/out/` 中的所有文件。
 
+### 搜索与分集 API（/mod）
+
+`GET /mod` 返回可下载插件名数组。`POST /mod` 调用站点插件的搜索与分集解析能力。
+
+按关键词搜索所有支持搜索的站点：
+
+```json
+{ "action": "search", "keyword": "柯南", "limit": 10 }
+```
+
+指定单个站点搜索：
+
+```json
+{ "action": "search", "mod": "sorani", "q": "柯南", "limit": 10 }
+```
+
+关键词字段支持 `keyword`、`query`、`q`、`wd`、`search`、`url`；默认最多返回 20 条，最多 50 条。搜索结果继续使用 `id`、`title`、`url`，并提供 `status`、`episodeCount` 和站点插件名 `mod`。
+
+用搜索结果中的作品编号获取每集编号：
+
+```json
+{ "action": "episodes", "mod": "sorani", "id": "4634" }
+```
+
+响应含作品状态和总集数，以及每集的 `id` / `input`。这些编号可直接作为 `POST /api/task` 的 `url`，并把搜索结果中的 `mod` 作为下载任务的 `mod`。sorani 的 `episodeId` 字段同时返回站点内部编号。
+
+分集解析可用 `maxEpisodes` 限制返回数量（默认 300，最大 500）。关键词最多 100 个字符。
+
 ### 旧协议 API（POST /）
 
 兼容旧客户端和简单 API 对接。使用 `Authorization: Bearer <密码>` 鉴权。
@@ -386,9 +414,9 @@ curl -N -H 'Content-Type: application/json' \
 
 | 插件 | 文件 | 适用站点 |
 |------|------|----------|
-| `mgnacg` | `mod/mgnacg.js` | 默认编号插件，解析选集编号为直链 |
+| `mgnacg` | `mod/mgnacg.js` | 默认编号下载解析、站内作品搜索、作品状态和分集编号 |
 | `danzhu` | `mod/danzhu.js` | dm.danzhuacg.com，输出 m3u8 并剔除广告分片 |
-| `sorani` | `mod/sorani.js` | www.sorani.net，解析 AES-128 加密 m3u8 |
+| `sorani` | `mod/sorani.js` | www.sorani.net 搜索、分集编号及 AES-128 加密 m3u8 下载解析 |
 
 ### 任务解析策略
 

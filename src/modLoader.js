@@ -59,8 +59,10 @@ function normalizeModResult(result) {
 
 function createModLoader() {
     const mods = new Map();
+    const searchMods = new Map();
     const load = () => {
         mods.clear();
+        searchMods.clear();
         const files = fs.existsSync(MOD_DIR) ? fs.readdirSync(MOD_DIR).filter((file) => file.endsWith('.js')) : [];
         for (const file of files) {
             const name = file.replace(/\.js$/i, '');
@@ -68,17 +70,25 @@ function createModLoader() {
             try {
                 delete require.cache[require.resolve(fullPath)];
                 const mod = require(fullPath);
-                if (typeof mod?.download !== 'function') {
-                    console.error(`[Mod] 跳过 ${file}: 未导出 download 函数`);
+                const entry = { name, file };
+                if (typeof mod?.download === 'function') entry.download = mod.download.bind(mod);
+                if (typeof mod?.search === 'function') entry.search = mod.search.bind(mod);
+                if (typeof mod?.episodes === 'function') entry.episodes = mod.episodes.bind(mod);
+                if (!entry.download && !entry.search) {
+                    console.error(`[Mod] 跳过 ${file}: 未导出 download 或 search 函数`);
                     continue;
                 }
-                mods.set(name, { name, file, download: mod.download.bind(mod) });
-                console.log(`[Mod] 已加载插件: ${name} (${file})`);
+                if (entry.download) mods.set(name, entry);
+                if (entry.search) searchMods.set(name, entry);
+                const capabilities = [entry.download && 'download', entry.search && 'search', entry.episodes && 'episodes']
+                    .filter(Boolean).join(', ');
+                console.log(`[Mod] 已加载插件: ${name} (${file}; ${capabilities})`);
             } catch (error) {
                 console.error(`[Mod] 加载失败 ${file}:`, error?.message || error);
             }
         }
         console.log(`[Mod] 共加载 ${mods.size} 个插件: ${[...mods.keys()].join(', ') || '无'}`);
+        console.log(`[Mod] 搜索能力 ${searchMods.size} 个: ${[...searchMods.keys()].join(', ') || '无'}`);
     };
     const get = (name) => {
         const normalized = sanitizeModName(name);
@@ -87,7 +97,14 @@ function createModLoader() {
         if (!mod) throw new Error(`未找到插件: ${normalized}（已加载: ${[...mods.keys()].join(', ') || '无'}）`);
         return mod;
     };
-    return { mods, load, get };
+    const getSearch = (name) => {
+        const normalized = sanitizeModName(name);
+        if (!normalized) return null;
+        const mod = searchMods.get(normalized);
+        if (!mod) throw new Error(`未找到搜索插件: ${normalized}（已加载: ${[...searchMods.keys()].join(', ') || '无'}）`);
+        return mod;
+    };
+    return { mods, searchMods, load, get, getSearch };
 }
 
 module.exports = { createModLoader, normalizeModResult, normalizeCutRanges, parseTimeToSeconds };
