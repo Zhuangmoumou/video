@@ -403,6 +403,59 @@ async function listEpisodes(input, options = {}) {
     throwIfAborted(signal);
 
     const detail = await apiGet(`/api/video/${videoId}`, { signal });
+
+    // The detail endpoint already contains episode IDs, orders, and titles.
+    // Prefer this embedded list so recursive listing does not depend on the
+    // separate play-lines endpoint being available.
+    const detailEpisodes = Array.isArray(detail?.episodes)
+        ? detail.episodes
+            .filter((episode) => episode && episode.enable !== false && episode.enabled !== false)
+            .map((episode) => ({
+                episode,
+                order: Number(episode.episodeOrder ?? episode.order),
+            }))
+            .filter(({ order }) => Number.isFinite(order) && order > 0)
+            .sort((a, b) => a.order - b.order)
+        : [];
+
+    if (detailEpisodes.length > 0) {
+        const selectedEpisodes = detailEpisodes.slice(0, maxEpisodes);
+        const episodes = selectedEpisodes.map(({ episode, order }) => {
+            const episodeId = Number(episode.episodeId ?? episode.id);
+            const downloadId = parsed.lineIndex != null
+                ? `${videoId}-${parsed.lineIndex}-${order}`
+                : parsed.lineCode
+                    ? `${videoId}-${parsed.lineCode}-${order}`
+                    : `${videoId}-${order}`;
+            return {
+                id: downloadId,
+                input: downloadId,
+                episodeId: Number.isFinite(episodeId) && episodeId > 0 ? episodeId : null,
+                order,
+                title: pickEpisodeTitle(episode, order),
+                url: buildPageUrl(videoId, order),
+            };
+        });
+        const reportedCount = Number(detail?.episodeCount);
+        const episodeCount = Number.isFinite(reportedCount) && reportedCount > detailEpisodes.length
+            ? reportedCount
+            : detailEpisodes.length;
+        const status = [detail?.statusText, detail?.updateStatus, detail?.stateText, detail?.status]
+            .map((value) => String(value || '').trim())
+            .find(Boolean) || (detail?.isFinished === true ? '已完结' : '未知');
+
+        return {
+            id: String(videoId),
+            title: String(detail?.title || '').trim() || String(videoId),
+            url: buildPageUrl(videoId),
+            status,
+            episodeCount,
+            episodes,
+            truncated: episodes.length < episodeCount,
+            lineCode: parsed.lineCode || null,
+        };
+    }
+
     const lines = await apiGet(`/api/video/${videoId}/play-lines`, { signal });
     const line = pickLine(lines, parsed);
     const lineCode = String(line?.code || '').trim();
