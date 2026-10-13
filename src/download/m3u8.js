@@ -5,6 +5,7 @@ const path = require('path');
 const { URL } = require('url');
 const { spawn } = require('child_process');
 const { createProgressLimiter, createSpeedAverager } = require('../utils/progress');
+const { MAX_DOWNLOAD_ATTEMPTS, retryDownload } = require('../utils/retry');
 
 const proxyDomain = (process.env.PROXY_DOMAIN || '').trim();
 
@@ -237,10 +238,9 @@ function decryptAes128(buffer, key, iv) {
  * M3U8 下载模块
  * 支持未加密分片，以及 HLS AES-128 加密分片。
  */
-async function downloadM3U8(m3u8Url, outputPath, onProgress, serverState, refererUrl, browserHeaders = null) {
-    const tempDir = path.join(path.dirname(outputPath), `m3u8_tmp_${Date.now()}`);
-    await fs.ensureDir(tempDir);
-
+async function downloadM3U8(m3u8Url, outputPath, onProgress, serverState, refererUrl, browserHeaders = null, resumeKey = m3u8Url) {
+    let tempDir = null;
+    let preserveTempDir = false;
     try {
         const headers = browserHeaders || {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
@@ -303,6 +303,93 @@ async function downloadM3U8(m3u8Url, outputPath, onProgress, serverState, refere
         const totalSegments = segments.length;
         if (totalSegments === 0) throw new Error("未找到有效的 TS 分片");
 
+        const segmentManifest = segments.map((segment) => ({
+            url: segment.url,
+            sequence: segment.sequence,
+            key: segment.key
+                ? { method: segment.key.method, uri: segment.key.uri, iv: segment.key.iv.toString('hex') }
+                : null
+        }));
+        const playlistFingerprint = crypto.createHash('sha256')
+            .update(JSON.stringify(segmentManifest))
+            .digest('hex');
+        const resumeId = crypto.createHash('sha256')
+            .update(String(resumeKey || m3u8Url))
+            .digest('hex')
+            .slice(0, 24);
+        tempDir = path.join(path.dirname(outputPath), `m3u8_tmp_${resumeId}`);
+        await fs.ensureDir(tempDir);
+
+        const resumePath = path.join(tempDir, '.resume.json');
+        let resumeData = null;
+        try {
+            const previous = await fs.readJson(resumePath);
+            if (previous.version === 1
+                && previous.fingerprint === playlistFingerprint
+                && previous.segmentCount === totalSegments
+                && Array.isArray(previous.completed)) {
+                resumeData = previous;
+            }
+        } catch (e) {}
+
+        if (!resumeData) {
+            await fs.emptyDir(tempDir);
+            resumeData = {
+                version: 1,
+                fingerprint: playlistFingerprint,
+                segmentCount: totalSegments,
+                completed: [],
+                updatedAt: new Date().toISOString()
+            };
+        }
+
+        const persistResumeData = async () => {
+            resumeData.updatedAt = new Date().toISOString();
+            const tempResumePath = `${resumePath}.tmp`;
+            await fs.writeFile(tempResumePath, JSON.stringify(resumeData));
+            await fs.rename(tempResumePath, resumePath);
+        };
+        await persistResumeData();
+
+        const completedSet = new Set(resumeData.completed.filter((index) =>
+            Number.isInteger(index) && index >= 0 && index < totalSegments));
+        const ffmpegList = [];
+        let downloadedCount = 0;
+        let totalBytes = 0;
+        for (let index = 0; index < totalSegments; index += 1) {
+            const tsFileName = `seg_${String(index).padStart(5, '0')}.ts`;
+            const tsPath = path.join(tempDir, tsFileName);
+            const partPath = `${tsPath}.part`;
+            let reusable = false;
+            if (completedSet.has(index)) {
+                try {
+                    const stat = await fs.stat(tsPath);
+                    reusable = stat.isFile() && stat.size > 0;
+                    if (reusable) totalBytes += stat.size;
+                } catch (e) {}
+            }
+            if (reusable) {
+                downloadedCount += 1;
+                ffmpegList[index] = `file '${tsFileName}'`;
+            } else {
+                completedSet.delete(index);
+                await fs.remove(tsPath).catch(() => {});
+            }
+            await fs.remove(partPath).catch(() => {});
+        }
+        resumeData.completed = [...completedSet].sort((a, b) => a - b);
+        await persistResumeData();
+
+        let resumeWriteChain = Promise.resolve();
+        const markSegmentComplete = (index) => {
+            resumeWriteChain = resumeWriteChain.then(async () => {
+                completedSet.add(index);
+                resumeData.completed = [...completedSet].sort((a, b) => a - b);
+                await persistResumeData();
+            });
+            return resumeWriteChain;
+        };
+
         const keyCache = new Map();
         const loadKey = async (keyUrl) => {
             if (keyCache.has(keyUrl)) return keyCache.get(keyUrl);
@@ -325,18 +412,15 @@ async function downloadM3U8(m3u8Url, outputPath, onProgress, serverState, refere
             return key;
         };
 
-        let downloadedCount = 0;
-        let totalBytes = 0;
         // 已向速度采样器报告过的最大字节数（并发分片乐观累计，保持单调不减，
         // 避免并发下字节数回退触发采样器重置）
-        let sampledBytes = 0;
+        let sampledBytes = totalBytes;
         const downloadSpeed = createSpeedAverager();
-        downloadSpeed.sample(0);
+        downloadSpeed.sample(totalBytes);
         const shouldReportProgress = createProgressLimiter();
         const CONCURRENCY = 8; 
-        const ffmpegList = [];
 
-        const reportProgress = (force = false) => {
+        const reportProgress = (force = false, retryMessage = null) => {
             const now = Date.now();
             const percent = Math.floor((downloadedCount / totalSegments) * 100);
             if (!shouldReportProgress({ force, percent })) return;
@@ -344,7 +428,7 @@ async function downloadM3U8(m3u8Url, outputPath, onProgress, serverState, refere
             const speed = downloadSpeed.getSpeed();
             const currMB = (totalBytes / 1024 / 1024).toFixed(2);
             const segProgress = `${downloadedCount}/${totalSegments}`;
-            onProgress(percent, `${currMB}MB`, segProgress, speed > 0 ? formatSpeed(speed) : '');
+            onProgress(percent, `${currMB}MB`, segProgress, speed > 0 ? formatSpeed(speed) : '', retryMessage);
         };
 
         // 分片卡住（无下载进度）时也周期性上报，速度会随时间衰减到 0，而不是停在旧值
@@ -355,43 +439,66 @@ async function downloadM3U8(m3u8Url, outputPath, onProgress, serverState, refere
                 if (serverState.abortController?.signal.aborted) throw new Error("任务被中止");
 
                 const chunk = segments.slice(i, i + CONCURRENCY);
-                await Promise.all(chunk.map(async (segment, index) => {
+                const results = await Promise.allSettled(chunk.map(async (segment, index) => {
                     const realIndex = i + index;
                     const tsFileName = `seg_${String(realIndex).padStart(5, '0')}.ts`;
                     const tsPath = path.join(tempDir, tsFileName);
+                    if (completedSet.has(realIndex)) return;
                     const url = applyProxy(segment.url);
                     const baseBytes = totalBytes;
 
-                    let response;
-                    try {
-                        response = await axios({
-                            url,
-                            responseType: 'arraybuffer',
-                            headers,
-                            timeout: 30000,
-                            signal: serverState.abortController?.signal,
-                            proxy: axiosProxy,
-                            onDownloadProgress: (e) => {
-                                // 每片报告"本片起点 + 本片已下载"，取全局最大值保持单调
-                                const optimistic = Math.max(totalBytes, baseBytes + (e.loaded || 0));
-                                if (optimistic > sampledBytes) {
-                                    sampledBytes = optimistic;
-                                    downloadSpeed.sample(sampledBytes);
+                    const data = await retryDownload(async () => {
+                        try {
+                            const response = await axios({
+                                url,
+                                responseType: 'arraybuffer',
+                                headers,
+                                timeout: 30000,
+                                signal: serverState.abortController?.signal,
+                                proxy: axiosProxy,
+                                onDownloadProgress: (e) => {
+                                    // 每片报告"本片起点 + 本片已下载"，取全局最大值保持单调
+                                    const optimistic = Math.max(totalBytes, baseBytes + (e.loaded || 0));
+                                    if (optimistic > sampledBytes) {
+                                        sampledBytes = optimistic;
+                                        downloadSpeed.sample(sampledBytes);
+                                    }
                                 }
+                            });
+                            let result = Buffer.from(response.data);
+                            if (result.length === 0) {
+                                throw new Error(`TS 分片 ${realIndex + 1}/${totalSegments} 下载结果为空`);
                             }
-                        });
+                            if (segment.key?.method === 'AES-128') {
+                                const key = await loadKey(segment.key.uri);
+                                result = decryptAes128(result, key, segment.key.iv);
+                            }
+                            if (result.length === 0) {
+                                throw new Error(`TS 分片 ${realIndex + 1}/${totalSegments} 解密结果为空`);
+                            }
+                            return result;
+                        } catch (error) {
+                            console.error('[Axios Error] TS分片请求失败\n' + formatAxiosError(error, `segment=${realIndex + 1}/${totalSegments}`));
+                            throw error;
+                        }
+                    }, {
+                        signal: serverState.abortController?.signal,
+                        maxAttempts: MAX_DOWNLOAD_ATTEMPTS,
+                        onRetry: (error, failedAttempt, maxAttempts) => {
+                            console.warn(`[Retry] TS分片 ${realIndex + 1}/${totalSegments} 第 ${failedAttempt}/${maxAttempts} 次失败: ${error.message || error}`);
+                            reportProgress(true, `⚠️ TS 分片 ${realIndex + 1}/${totalSegments} 第 ${failedAttempt} 次失败，准备第 ${failedAttempt + 1} 次重试`);
+                        }
+                    });
+
+                    const partPath = `${tsPath}.part`;
+                    try {
+                        await fs.writeFile(partPath, data);
+                        await fs.rename(partPath, tsPath);
                     } catch (error) {
-                        console.error('[Axios Error] TS分片请求失败\n' + formatAxiosError(error, `segment=${realIndex + 1}/${totalSegments}`));
+                        await fs.remove(partPath).catch(() => {});
                         throw error;
                     }
-
-                    let data = Buffer.from(response.data);
-                    if (segment.key?.method === 'AES-128') {
-                        const key = await loadKey(segment.key.uri);
-                        data = decryptAes128(data, key, segment.key.iv);
-                    }
-
-                    await fs.writeFile(tsPath, data);
+                    await markSegmentComplete(realIndex);
 
                     totalBytes += data.length;
                     if (totalBytes > sampledBytes) {
@@ -402,6 +509,8 @@ async function downloadM3U8(m3u8Url, outputPath, onProgress, serverState, refere
                     ffmpegList[realIndex] = `file '${tsFileName}'`;
                     reportProgress(false);
                 }));
+                const failedResult = results.find((result) => result.status === 'rejected');
+                if (failedResult) throw failedResult.reason;
             }
         } finally {
             clearInterval(speedTimer);
@@ -441,9 +550,14 @@ async function downloadM3U8(m3u8Url, outputPath, onProgress, serverState, refere
         });
 
         await ffmpegPromise;
-
+        const completedTempDir = tempDir;
+        tempDir = null;
+        return completedTempDir;
+    } catch (error) {
+        preserveTempDir = Boolean(tempDir);
+        throw error;
     } finally {
-        await fs.remove(tempDir).catch(() => {});
+        if (tempDir && !preserveTempDir) await fs.remove(tempDir).catch(() => {});
     }
 }
 

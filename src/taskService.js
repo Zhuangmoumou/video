@@ -5,6 +5,7 @@ const { ROOT_DIR, OUT_DIR, API_DEFAULT_RESOLUTION, FRONTEND_DEFAULT_RESOLUTION, 
 const { sanitizeModName, sanitizeTaskFileBase, resolveInsideDir, splitTaskFiles } = require('./utils/validation');
 const { createProgressLimiter, createSpeedAverager } = require('./utils/progress');
 const { isAbortError, throwIfAborted } = require('./utils/abort');
+const { MAX_DOWNLOAD_ATTEMPTS, retryDownload } = require('./utils/retry');
 const { downloadM3U8 } = require('./download/m3u8');
 const { downloadMp4WithRedirects, getAxiosProxyConfig, formatSpeed } = require('./download/mp4');
 const { compressVideo, formatCutRange } = require('./videoProcessor');
@@ -99,7 +100,11 @@ const forceCleanFiles = async () => {
         const rootFiles = await fs.readdir(ROOT_DIR);
         for (const file of rootFiles) {
             const filePath = path.join(ROOT_DIR, file);
-            if ((await fs.stat(filePath)).isFile()) { await fs.remove(filePath); deletedFiles.push(file); }
+            const stat = await fs.stat(filePath);
+            if (stat.isFile() || (stat.isDirectory() && file.startsWith('m3u8_tmp_'))) {
+                await fs.remove(filePath);
+                deletedFiles.push(file);
+            }
         }
         const outFiles = await fs.readdir(OUT_DIR);
         for (const file of outFiles) {
@@ -155,6 +160,7 @@ const processTask = async (urlFragment, file = null, code, res, modName = null, 
         }
     });
     let logHistory = [];
+    let m3u8ResumeDir = null;
 
     const updateStatus = (newLogMsg, dynamicStatus = "") => {
         if (newLogMsg) {
@@ -273,59 +279,80 @@ const processTask = async (urlFragment, file = null, code, res, modName = null, 
 
         if (isM3U8) {
             updateStatus(`📦 M3U8 模式...`);
-            await downloadM3U8(
+            m3u8ResumeDir = await downloadM3U8(
                 mediaUrl,
                 downloadPath,
-                (p, s, seg, speed) => {
+                (p, s, seg, speed, retryMessage) => {
                     const speedText = speed ? ` ${speed}` : '';
-                    updateStatus(null, `📥 下载: ${p}% (${s}) [分片:${seg}]${speedText}`);
+                    updateStatus(retryMessage || null, `📥 下载: ${p}% (${s}) [分片:${seg}]${speedText}`);
                 },
                 state,
                 refererUrl || fullUrl,
-                headers
+                headers,
+                `${requestedMod || (useDefaultMgnacg ? 'mgnacg' : 'browser')}\n${String(urlFragment)}`
             );
         } else {
-            const { response, finalUrl, hops } = await downloadMp4WithRedirects(
-                mediaUrl,
-                headers,
-                state.abortController.signal,
-                getAxiosProxyConfig()
-            );
-            if (hops.length) {
-                updateStatus(`🔀 跟随重定向 ${hops.length} 次: ${finalUrl.substring(0, 80)}...`);
-            }
+            await retryDownload(async () => {
+                let response;
+                try {
+                    const result = await downloadMp4WithRedirects(
+                        mediaUrl,
+                        headers,
+                        state.abortController.signal,
+                        getAxiosProxyConfig()
+                    );
+                    response = result.response;
+                    if (result.hops.length) {
+                        updateStatus(`🔀 跟随重定向 ${result.hops.length} 次: ${result.finalUrl.substring(0, 80)}...`);
+                    }
 
-            const total = parseInt(response.headers['content-length'] || '0', 10);
-            const totalMB = (total / 1024 / 1024).toFixed(2);
+                    const total = parseInt(response.headers['content-length'] || '0', 10);
+                    const totalMB = (total / 1024 / 1024).toFixed(2);
+                    let curr = 0;
+                    const downloadSpeed = createSpeedAverager();
+                    downloadSpeed.sample(0);
+                    const shouldReportDownloadProgress = createProgressLimiter();
 
-            let curr = 0;
-            const downloadSpeed = createSpeedAverager();
-            downloadSpeed.sample(0);
-            const shouldReportDownloadProgress = createProgressLimiter();
+                    const renderDownloadStatus = (now = Date.now()) => {
+                        const p = total ? Math.floor((curr / total) * 100) : 0;
+                        const speed = downloadSpeed.getSpeed(now);
+                        const speedText = speed > 0 ? ` ${formatSpeed(speed)}` : '';
+                        const currMB = (curr / 1024 / 1024).toFixed(2);
+                        updateStatus(null, `📥 下载: ${p}% (${currMB}/${totalMB}MB)${speedText}`);
+                    };
 
-            const renderDownloadStatus = (now = Date.now()) => {
-                const p = total ? Math.floor((curr / total) * 100) : 0;
-                const speed = downloadSpeed.getSpeed(now);
-                const speedText = speed > 0 ? ` ${formatSpeed(speed)}` : '';
-                const currMB = (curr / 1024 / 1024).toFixed(2);
-                updateStatus(null, `📥 下载: ${p}% (${currMB}/${totalMB}MB)${speedText}`);
-            };
+                    response.data.on('data', (chunk) => {
+                        curr += chunk.length;
+                        downloadSpeed.sample(curr, Date.now());
+                        const p = total ? Math.floor((curr / total) * 100) : 0;
+                        if (!shouldReportDownloadProgress({ percent: p })) return;
+                        renderDownloadStatus();
+                    });
 
-            response.data.on('data', (c) => {
-                curr += c.length;
-                downloadSpeed.sample(curr, Date.now());
-                const p = total ? Math.floor((curr / total) * 100) : 0;
-                if (!shouldReportDownloadProgress({ percent: p })) return;
-                renderDownloadStatus();
+                    // 下载卡住（无 data 事件）时也周期性刷新，速度会随时间衰减到 0，而不是停在旧值
+                    const speedTimer = setInterval(() => renderDownloadStatus(), 1000);
+                    try {
+                        await pipeline(response.data, fs.createWriteStream(downloadPath));
+                        if (curr === 0) throw new Error('MP4 下载结果为空');
+                    } finally {
+                        clearInterval(speedTimer);
+                    }
+                } catch (error) {
+                    response?.data?.destroy();
+                    await fs.remove(downloadPath).catch(() => {});
+                    throw error;
+                }
+            }, {
+                signal: state.abortController.signal,
+                maxAttempts: MAX_DOWNLOAD_ATTEMPTS,
+                onRetry: (error, failedAttempt) => {
+                    console.warn(`[Retry] MP4 下载第 ${failedAttempt}/${MAX_DOWNLOAD_ATTEMPTS} 次失败: ${error.message || error}`);
+                    updateStatus(
+                        `⚠️ MP4 下载第 ${failedAttempt} 次失败，准备第 ${failedAttempt + 1} 次重试: ${error.message || error}`,
+                        `🔁 下载重试中（${failedAttempt + 1}/${MAX_DOWNLOAD_ATTEMPTS}）`
+                    );
+                }
             });
-
-            // 下载卡住（无 data 事件）时也周期性刷新，速度会随时间衰减到 0，而不是停在旧值
-            const speedTimer = setInterval(() => renderDownloadStatus(), 1000);
-            try {
-                await pipeline(response.data, fs.createWriteStream(downloadPath));
-            } finally {
-                clearInterval(speedTimer);
-            }
         }
 
         state.currentTask = 'FFmpeg压缩';
@@ -334,6 +361,10 @@ const processTask = async (urlFragment, file = null, code, res, modName = null, 
         }
         updateStatus(null, `📦 压缩中...`);
         await compressVideo(downloadPath, outPath, cutRanges, compressionProfile, state, updateStatus);
+        if (m3u8ResumeDir) {
+            await fs.remove(m3u8ResumeDir).catch(() => {});
+            m3u8ResumeDir = null;
+        }
 
         if (pageTitle) {
             updateStatus(`✅ 任务完成: ${pageTitle}\n\n`);
